@@ -61,7 +61,7 @@ void Application::loadScene()
 		    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
 		    {{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}}};
 		sceneData.indices = {0, 1, 2};
-		sceneData.materials.push_back({glm::vec4(0.8f, 0.3f, 0.3f, 1.0f), 0.0f, 0.5f, -1, 0});
+		sceneData.materials.push_back({glm::vec4(0.8f, 0.3f, 0.3f, 1.0f), 0.0f, 0.5f, 0.0f, 1.5f, -1, {0, 0, 0}});
 		sceneData.subMeshes.push_back({0, 3, 0, 0});
 		sceneData.instances.push_back({glm::mat4(1.0f), 0});
 	}
@@ -190,15 +190,16 @@ void Application::mainLoop()
 		}
 
 		PushConstants pc{};
-		pc.cameraPos = glm::vec4(camera.getPosition(), 1.0f);
-		pc.cameraDir = glm::vec4(camera.getForward(), 0.0f);
-		pc.cameraUp = glm::vec4(camera.getUp(), 0.0f);
-		pc.cameraRight = glm::vec4(camera.getRight(), 0.0f);
-		pc.projParams = glm::vec4(tan(glm::radians(camera.getFov() * 0.5f)), (float)vContext.getExtent().width / vContext.getExtent().height, 0.0f, 0.0f);
+		pc.camPos_Fov = glm::vec4(camera.getPosition(), tan(glm::radians(camera.getFov() * 0.5f)));
+		pc.camDir_Aspect = glm::vec4(camera.getForward(), (float)vContext.getExtent().width / vContext.getExtent().height);
+		pc.camUp_Frame = glm::vec4(camera.getUp(), static_cast<float>(frameCount++));
+		pc.camRight_EnvInt = glm::vec4(camera.getRight(), sceneConfig.envIntensity);
 
-		pc.envConfig = glm::vec4(sceneConfig.envColor * sceneConfig.envIntensity, frameCount++);
-		pc.lightDir = glm::vec4(sceneConfig.lightDirection, sceneConfig.lightAngleRadius);
-		pc.lightColor = glm::vec4(sceneConfig.lightColor * sceneConfig.lightIntensity, 0.0f);
+		pc.envColor_LgAng = glm::vec4(sceneConfig.envColor, sceneConfig.lightAngleRadius);
+		pc.lightDir_LgInt = glm::vec4(sceneConfig.lightDirection, sceneConfig.lightIntensity);
+
+		pc.albedo_Rough = glm::vec4(sceneConfig.albedo, sceneConfig.roughness);
+		pc.matParams = glm::vec4(sceneConfig.metallic, sceneConfig.transmission, sceneConfig.ior, sceneConfig.overrideMaterial ? 1.0f : 0.0f);
 
 		rtPipeline.bind(commandBuffer);
 		rtPipeline.bindDescriptorSets(commandBuffer, &rtDescriptorSet);

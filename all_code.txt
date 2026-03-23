@@ -1,0 +1,3234 @@
+CMakeLists.txt:
+```
+cmake_minimum_required(VERSION 3.20)
+project(VulkanRayTracer)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(Vulkan REQUIRED)
+find_package(glfw3 REQUIRED)
+find_package(glm REQUIRED)
+find_program(GLSLC glslc REQUIRED)
+
+# 自动拉取 Dear ImGui Docking 分支
+include(FetchContent)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG docking
+)
+FetchContent_MakeAvailable(imgui)
+
+# 自动拉取 tinygltf
+FetchContent_Declare(
+    tinygltf
+    GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+    GIT_TAG release
+)
+FetchContent_MakeAvailable(tinygltf)
+
+set(IMGUI_SOURCES
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
+
+set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+# 目前只列出实现了的光追着色器
+set(SHADERS 
+    "${SHADER_DIR}/raygen.rgen" 
+    "${SHADER_DIR}/miss.rmiss" 
+    "${SHADER_DIR}/closesthit.rchit"
+    "${SHADER_DIR}/shadow.rmiss"
+)
+set(SPIRV_SHADERS "")
+
+foreach(SHADER ${SHADERS})
+    get_filename_component(FILE_NAME ${SHADER} NAME)
+    # 将输出定向到构建目录的 shaders 文件夹中
+    set(SPIRV_FILE "${CMAKE_CURRENT_BINARY_DIR}/shaders/${FILE_NAME}.spv")
+    list(APPEND SPIRV_SHADERS ${SPIRV_FILE})
+    
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+        # 强制指定 target-env 为 vulkan1.2 以支持光追扩展特性
+        COMMAND ${GLSLC} --target-env=vulkan1.2 ${SHADER} -o ${SPIRV_FILE}
+        DEPENDS ${SHADER}
+    )
+endforeach()
+
+add_custom_target(CompileShaders ALL DEPENDS ${SPIRV_SHADERS})
+
+file(GLOB SOURCES "src/*.cpp" "src/*.h")
+add_executable(${PROJECT_NAME} ${SOURCES} ${IMGUI_SOURCES})
+add_dependencies(${PROJECT_NAME} CompileShaders)
+
+target_include_directories(${PROJECT_NAME} PRIVATE 
+    ${imgui_SOURCE_DIR} 
+    ${imgui_SOURCE_DIR}/backends
+    ${tinygltf_SOURCE_DIR}
+    src
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE Vulkan::Vulkan glfw glm::glm)
+```
+
+src/VulkanDevice.cpp:
+```
+#include "VulkanDevice.h"
+#include <stdexcept>
+#include <iostream>
+#include <set>
+
+void VulkanDevice::init(GLFWwindow *window)
+{
+	createInstance();
+	createSurface(window);
+	pickPhysicalDevice();
+	createLogicalDevice();
+	loadExtensionFunctions();
+	createCommandPool();
+}
+
+void VulkanDevice::cleanup()
+{
+	vkDestroyCommandPool(device, commandPool, nullptr);
+	vkDestroyDevice(device, nullptr);
+	vkDestroySurfaceKHR(instance, surface, nullptr);
+	vkDestroyInstance(instance, nullptr);
+}
+
+void VulkanDevice::deviceWaitIdle()
+{
+	vkDeviceWaitIdle(device);
+}
+
+void VulkanDevice::createInstance()
+{
+	VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "Vulkan RT Engine", VK_MAKE_VERSION(1, 0, 0), "No Engine", VK_MAKE_VERSION(1, 0, 0), VK_API_VERSION_1_3};
+	VkInstanceCreateInfo createInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &appInfo, 0, nullptr, 0, nullptr};
+
+	uint32_t glfwExtensionCount = 0;
+	const char **glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
+	std::vector<const char *> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+
+	createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+	createInfo.ppEnabledExtensionNames = extensions.data();
+
+	if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS)
+		throw std::runtime_error("failed to create instance!");
+}
+
+void VulkanDevice::createSurface(GLFWwindow *window)
+{
+	if (glfwCreateWindowSurface(instance, window, nullptr, &surface) != VK_SUCCESS)
+		throw std::runtime_error("failed to create window surface!");
+}
+
+void VulkanDevice::pickPhysicalDevice()
+{
+	uint32_t deviceCount = 0;
+	vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
+	if (deviceCount == 0)
+		throw std::runtime_error("failed to find GPUs with Vulkan support!");
+
+	std::vector<VkPhysicalDevice> devices(deviceCount);
+	vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
+
+	for (const auto &dev : devices)
+	{
+		if (isDeviceSuitable(dev))
+		{
+			physicalDevice = dev;
+			break;
+		}
+	}
+	if (physicalDevice == VK_NULL_HANDLE)
+		throw std::runtime_error("failed to find a suitable GPU!");
+
+	rtProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+	VkPhysicalDeviceProperties2 deviceProperties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &rtProperties};
+	vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
+	std::cout << "Using Hardware: " << deviceProperties2.properties.deviceName << "\n";
+}
+
+bool VulkanDevice::isDeviceSuitable(VkPhysicalDevice device) const
+{
+	QueueFamilyIndices indices = findQueueFamilies(device);
+	uint32_t extensionCount;
+	vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
+	std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+	vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, availableExtensions.data());
+
+	std::set<std::string> requiredExtensions(deviceExtensions.begin(), deviceExtensions.end());
+	for (const auto &extension : availableExtensions)
+	{
+		requiredExtensions.erase(extension.extensionName);
+	}
+
+	bool swapChainAdequate = false;
+	if (requiredExtensions.empty())
+	{
+		SwapChainSupportDetails swapChainSupport = querySwapChainSupport(device);
+		swapChainAdequate = !swapChainSupport.formats.empty() && !swapChainSupport.presentModes.empty();
+	}
+	return indices.isComplete() && requiredExtensions.empty() && swapChainAdequate;
+}
+
+QueueFamilyIndices VulkanDevice::findQueueFamilies(VkPhysicalDevice device) const
+{
+	QueueFamilyIndices indices;
+	uint32_t queueFamilyCount = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr);
+	std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+	vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
+
+	int i = 0;
+	for (const auto &queueFamily : queueFamilies)
+	{
+		if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT)
+			indices.graphicsFamily = i;
+		VkBool32 presentSupport = false;
+		vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &presentSupport);
+		if (presentSupport)
+			indices.presentFamily = i;
+		if (indices.isComplete())
+			break;
+		i++;
+	}
+	return indices;
+}
+
+SwapChainSupportDetails VulkanDevice::querySwapChainSupport(VkPhysicalDevice device) const
+{
+	SwapChainSupportDetails details;
+	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface, &details.capabilities);
+	uint32_t formatCount;
+	vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount, nullptr);
+	if (formatCount != 0)
+	{
+		details.formats.resize(formatCount);
+		vkGetPhysicalDeviceSurfaceFormatsKHR(device, surface, &formatCount, details.formats.data());
+	}
+	uint32_t presentModeCount;
+	vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &presentModeCount, nullptr);
+	if (presentModeCount != 0)
+	{
+		details.presentModes.resize(presentModeCount);
+		vkGetPhysicalDeviceSurfacePresentModesKHR(device, surface, &presentModeCount, details.presentModes.data());
+	}
+	return details;
+}
+
+void VulkanDevice::createLogicalDevice()
+{
+	QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+	std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+	std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsFamily.value(), indices.presentFamily.value()};
+	float queuePriority = 1.0f;
+	for (uint32_t queueFamily : uniqueQueueFamilies)
+	{
+		queueCreateInfos.push_back({VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, queueFamily, 1, &queuePriority});
+	}
+
+	// 正确的硬件特性请求链构造
+	VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures{};
+	bufferDeviceAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+	bufferDeviceAddressFeatures.bufferDeviceAddress = VK_TRUE;
+
+	VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures{};
+	rayTracingPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+	rayTracingPipelineFeatures.pNext = &bufferDeviceAddressFeatures;
+	rayTracingPipelineFeatures.rayTracingPipeline = VK_TRUE;
+
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{};
+	accelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+	accelerationStructureFeatures.pNext = &rayTracingPipelineFeatures;
+	accelerationStructureFeatures.accelerationStructure = VK_TRUE;
+
+	// 显式请求 Vulkan 1.2 核心特性 (描述符索引等)
+	VkPhysicalDeviceVulkan12Features vulkan12Features{};
+	vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+	vulkan12Features.pNext = &accelerationStructureFeatures;
+	vulkan12Features.runtimeDescriptorArray = VK_TRUE;
+	vulkan12Features.descriptorIndexing = VK_TRUE;
+	vulkan12Features.bufferDeviceAddress = VK_TRUE;
+
+	VkPhysicalDeviceFeatures2 deviceFeatures2{};
+	deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	deviceFeatures2.pNext = &vulkan12Features;
+
+	VkDeviceCreateInfo createInfo{};
+	createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	createInfo.pNext = &deviceFeatures2;
+	createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+	createInfo.pQueueCreateInfos = queueCreateInfos.data();
+	createInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
+	createInfo.ppEnabledExtensionNames = deviceExtensions.data();
+
+	if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS)
+		throw std::runtime_error("failed to create logical device!");
+
+	vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
+	vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
+}
+
+void VulkanDevice::loadExtensionFunctions()
+{
+	vkGetBufferDeviceAddress = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddress"));
+	vkCreateAccelerationStructureKHR = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
+	vkDestroyAccelerationStructureKHR = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR"));
+	vkGetAccelerationStructureBuildSizesKHR = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR"));
+	vkGetAccelerationStructureDeviceAddressKHR = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR"));
+	vkCmdBuildAccelerationStructuresKHR = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR"));
+	vkCreateRayTracingPipelinesKHR = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR"));
+	vkGetRayTracingShaderGroupHandlesKHR = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR"));
+	vkCmdTraceRaysKHR = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR"));
+}
+
+void VulkanDevice::createCommandPool()
+{
+	QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
+	VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, queueFamilyIndices.graphicsFamily.value()};
+	if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
+		throw std::runtime_error("failed to create command pool!");
+}
+
+uint32_t VulkanDevice::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties)
+{
+	VkPhysicalDeviceMemoryProperties memProperties;
+	vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+	for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
+	{
+		if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
+			return i;
+	}
+	throw std::runtime_error("failed to find suitable memory type!");
+}
+
+AllocatedBuffer VulkanDevice::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties)
+{
+	AllocatedBuffer result;
+	VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, size, usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
+	if (vkCreateBuffer(device, &bufferInfo, nullptr, &result.buffer) != VK_SUCCESS)
+		throw std::runtime_error("failed to create buffer!");
+
+	VkMemoryRequirements memRequirements;
+	vkGetBufferMemoryRequirements(device, result.buffer, &memRequirements);
+	VkMemoryAllocateFlagsInfo allocFlagsInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+	VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &allocFlagsInfo, memRequirements.size, findMemoryType(memRequirements.memoryTypeBits, properties)};
+
+	if (vkAllocateMemory(device, &allocInfo, nullptr, &result.memory) != VK_SUCCESS)
+		throw std::runtime_error("failed to allocate buffer memory!");
+	vkBindBufferMemory(device, result.buffer, result.memory, 0);
+
+	VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, result.buffer};
+	result.deviceAddress = vkGetBufferDeviceAddress(device, &addressInfo);
+	return result;
+}
+
+void VulkanDevice::destroyBuffer(const AllocatedBuffer &allocatedBuffer)
+{
+	if (allocatedBuffer.buffer != VK_NULL_HANDLE)
+	{
+		vkDestroyBuffer(device, allocatedBuffer.buffer, nullptr);
+		vkFreeMemory(device, allocatedBuffer.memory, nullptr);
+	}
+}
+
+VkCommandBuffer VulkanDevice::beginSingleTimeCommands()
+{
+	VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, commandPool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+	VkCommandBuffer cmdBuffer;
+	vkAllocateCommandBuffers(device, &allocInfo, &cmdBuffer);
+	VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+	vkBeginCommandBuffer(cmdBuffer, &beginInfo);
+	return cmdBuffer;
+}
+
+void VulkanDevice::endSingleTimeCommands(VkCommandBuffer cmdBuffer)
+{
+	vkEndCommandBuffer(cmdBuffer);
+	VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmdBuffer, 0, nullptr};
+	vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+	vkQueueWaitIdle(graphicsQueue);
+	vkFreeCommandBuffers(device, commandPool, 1, &cmdBuffer);
+}
+```
+
+src/VulkanDevice.h:
+```
+#pragma once
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
+#include <vector>
+#include <optional>
+#include <string>
+#include <glm/glm.hpp>
+
+#include "Types.h"
+
+struct QueueFamilyIndices
+{
+	std::optional<uint32_t> graphicsFamily;
+	std::optional<uint32_t> presentFamily;
+	bool isComplete() const { return graphicsFamily.has_value() && presentFamily.has_value(); }
+};
+
+struct SwapChainSupportDetails
+{
+	VkSurfaceCapabilitiesKHR capabilities;
+	std::vector<VkSurfaceFormatKHR> formats;
+	std::vector<VkPresentModeKHR> presentModes;
+};
+
+class VulkanDevice
+{
+public:
+	void init(GLFWwindow *window);
+	void cleanup();
+	void deviceWaitIdle();
+
+	uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
+	AllocatedBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
+	void destroyBuffer(const AllocatedBuffer &allocatedBuffer);
+	VkCommandBuffer beginSingleTimeCommands();
+	void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+
+	QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device) const;
+	SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device) const;
+
+	VkInstance instance = VK_NULL_HANDLE;
+	VkSurfaceKHR surface = VK_NULL_HANDLE;
+	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+	VkDevice device = VK_NULL_HANDLE;
+	VkQueue graphicsQueue = VK_NULL_HANDLE;
+	VkQueue presentQueue = VK_NULL_HANDLE;
+	VkCommandPool commandPool = VK_NULL_HANDLE;
+
+	VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProperties{};
+
+	PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress;
+	PFN_vkCreateAccelerationStructureKHR vkCreateAccelerationStructureKHR;
+	PFN_vkDestroyAccelerationStructureKHR vkDestroyAccelerationStructureKHR;
+	PFN_vkGetAccelerationStructureBuildSizesKHR vkGetAccelerationStructureBuildSizesKHR;
+	PFN_vkGetAccelerationStructureDeviceAddressKHR vkGetAccelerationStructureDeviceAddressKHR;
+	PFN_vkCmdBuildAccelerationStructuresKHR vkCmdBuildAccelerationStructuresKHR;
+	PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR;
+	PFN_vkGetRayTracingShaderGroupHandlesKHR vkGetRayTracingShaderGroupHandlesKHR;
+	PFN_vkCmdTraceRaysKHR vkCmdTraceRaysKHR;
+
+private:
+	void createInstance();
+	void createSurface(GLFWwindow *window);
+	void pickPhysicalDevice();
+	void createLogicalDevice();
+	void loadExtensionFunctions();
+	void createCommandPool();
+	bool isDeviceSuitable(VkPhysicalDevice device) const;
+
+	// 清理了 Vulkan 1.2/1.3 已转正的核心扩展，避免驱动合规性报错
+	const std::vector<const char *> deviceExtensions = {
+	    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+	    VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+	    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+	    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
+};
+```
+
+src/VulkanContext.h:
+```
+#pragma once
+#include "VulkanDevice.h"
+#include <vector>
+
+class VulkanContext
+{
+public:
+	static constexpr int MAX_FRAMES_IN_FLIGHT = 2; // 引入多帧并发
+
+	void init(VulkanDevice *device, GLFWwindow *window);
+	void cleanup();
+	void recreateSwapChain();
+
+	VkCommandBuffer beginFrame(uint32_t &imageIndex);
+	bool endFrame(VkCommandBuffer cb, uint32_t imageIndex);
+
+	VkRenderPass getRenderPass() const { return renderPass; }
+	VkExtent2D getExtent() const { return swapChainExtent; }
+	VkImage getSwapChainImage(uint32_t index) const { return swapChainImages[index]; }
+	VkFramebuffer getFramebuffer(uint32_t index) const { return swapChainFramebuffers[index]; }
+
+private:
+	void createSwapChain();
+	void createImageViews();
+	void createRenderPass();
+	void createFramebuffers();
+	void createCommandBuffers(); // 改为复数
+	void createSyncObjects();
+	void cleanupSwapChain();
+
+	VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR> &availableFormats);
+	VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR> &availablePresentModes);
+	VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities);
+
+	VulkanDevice *vDevice;
+	GLFWwindow *window;
+
+	VkSwapchainKHR swapChain = VK_NULL_HANDLE;
+	std::vector<VkImage> swapChainImages;
+	VkFormat swapChainImageFormat;
+	VkExtent2D swapChainExtent;
+	std::vector<VkImageView> swapChainImageViews;
+	std::vector<VkFramebuffer> swapChainFramebuffers;
+	VkRenderPass renderPass;
+
+	// 向量化每帧状态对象
+	std::vector<VkCommandBuffer> commandBuffers;
+	std::vector<VkSemaphore> imageAvailableSemaphores;
+	std::vector<VkSemaphore> renderFinishedSemaphores;
+	std::vector<VkFence> inFlightFences;
+	uint32_t currentFrame = 0;
+};
+```
+
+src/VulkanContext.cpp:
+```
+#include "VulkanContext.h"
+#include <stdexcept>
+#include <algorithm>
+#include <limits>
+
+void VulkanContext::init(VulkanDevice *device, GLFWwindow *win)
+{
+	vDevice = device;
+	window = win;
+
+	createSwapChain();
+	createImageViews();
+	createRenderPass();
+	createFramebuffers();
+	createCommandBuffers();
+	createSyncObjects();
+}
+
+void VulkanContext::cleanup()
+{
+	cleanupSwapChain();
+	vkDestroyRenderPass(vDevice->device, renderPass, nullptr);
+
+	for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+	{
+		vkDestroySemaphore(vDevice->device, renderFinishedSemaphores[i], nullptr);
+		vkDestroySemaphore(vDevice->device, imageAvailableSemaphores[i], nullptr);
+		vkDestroyFence(vDevice->device, inFlightFences[i], nullptr);
+	}
+}
+
+void VulkanContext::cleanupSwapChain()
+{
+	for (auto framebuffer : swapChainFramebuffers)
+	{
+		vkDestroyFramebuffer(vDevice->device, framebuffer, nullptr);
+	}
+	for (auto imageView : swapChainImageViews)
+	{
+		vkDestroyImageView(vDevice->device, imageView, nullptr);
+	}
+	vkDestroySwapchainKHR(vDevice->device, swapChain, nullptr);
+}
+
+void VulkanContext::recreateSwapChain()
+{
+	int width = 0, height = 0;
+	glfwGetFramebufferSize(window, &width, &height);
+	while (width == 0 || height == 0)
+	{
+		glfwGetFramebufferSize(window, &width, &height);
+		glfwWaitEvents();
+	}
+
+	vkDeviceWaitIdle(vDevice->device);
+	cleanupSwapChain();
+
+	createSwapChain();
+	createImageViews();
+	createFramebuffers();
+}
+
+VkCommandBuffer VulkanContext::beginFrame(uint32_t &imageIndex)
+{
+	vkWaitForFences(vDevice->device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+	VkResult result = vkAcquireNextImageKHR(vDevice->device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+
+	if (result == VK_ERROR_OUT_OF_DATE_KHR)
+		return VK_NULL_HANDLE;
+	else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+		throw std::runtime_error("failed to acquire swap chain image!");
+
+	vkResetFences(vDevice->device, 1, &inFlightFences[currentFrame]);
+	vkResetCommandBuffer(commandBuffers[currentFrame], 0);
+
+	VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	vkBeginCommandBuffer(commandBuffers[currentFrame], &beginInfo);
+	return commandBuffers[currentFrame];
+}
+
+bool VulkanContext::endFrame(VkCommandBuffer cb, uint32_t imageIndex)
+{
+	if (vkEndCommandBuffer(cb) != VK_SUCCESS)
+		throw std::runtime_error("failed to record command buffer!");
+
+	// 修复竞争：将管线等待阶段严格同步到写入颜色的阶段
+	VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+	VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 1, &imageAvailableSemaphores[currentFrame], waitStages, 1, &cb, 1, &renderFinishedSemaphores[currentFrame]};
+
+	if (vkQueueSubmit(vDevice->graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS)
+		throw std::runtime_error("failed to submit draw command buffer!");
+
+	VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, nullptr, 1, &renderFinishedSemaphores[currentFrame], 1, &swapChain, &imageIndex, nullptr};
+	VkResult result = vkQueuePresentKHR(vDevice->presentQueue, &presentInfo);
+
+	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+		return true;
+	else if (result != VK_SUCCESS)
+		throw std::runtime_error("failed to present swap chain image!");
+
+	currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+	return false;
+}
+
+VkSurfaceFormatKHR VulkanContext::chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR> &availableFormats)
+{
+	for (const auto &format : availableFormats)
+	{
+		if (format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+			return format;
+	}
+	return availableFormats[0];
+}
+
+VkPresentModeKHR VulkanContext::chooseSwapPresentMode(const std::vector<VkPresentModeKHR> &availablePresentModes)
+{
+	for (const auto &presentMode : availablePresentModes)
+	{
+		if (presentMode == VK_PRESENT_MODE_MAILBOX_KHR)
+			return presentMode;
+	}
+	return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+VkExtent2D VulkanContext::chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities)
+{
+	if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max())
+	{
+		return capabilities.currentExtent;
+	}
+	else
+	{
+		int width, height;
+		glfwGetFramebufferSize(window, &width, &height);
+		VkExtent2D actualExtent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+		actualExtent.width = std::clamp(actualExtent.width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
+		actualExtent.height = std::clamp(actualExtent.height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+		return actualExtent;
+	}
+}
+
+void VulkanContext::createSwapChain()
+{
+	SwapChainSupportDetails support = vDevice->querySwapChainSupport(vDevice->physicalDevice);
+	VkSurfaceFormatKHR surfaceFormat = chooseSwapSurfaceFormat(support.formats);
+	VkPresentModeKHR presentMode = chooseSwapPresentMode(support.presentModes);
+	VkExtent2D extent = chooseSwapExtent(support.capabilities);
+	uint32_t imageCount = support.capabilities.minImageCount + 1;
+
+	VkSwapchainCreateInfoKHR createInfo{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, nullptr, 0, vDevice->surface, imageCount, surfaceFormat.format, surfaceFormat.colorSpace, extent, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+
+	QueueFamilyIndices indices = vDevice->findQueueFamilies(vDevice->physicalDevice);
+	uint32_t queueFamilyIndices[] = {indices.graphicsFamily.value(), indices.presentFamily.value()};
+	if (indices.graphicsFamily != indices.presentFamily)
+	{
+		createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+		createInfo.queueFamilyIndexCount = 2;
+		createInfo.pQueueFamilyIndices = queueFamilyIndices;
+	}
+	else
+	{
+		createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	}
+	createInfo.preTransform = support.capabilities.currentTransform;
+	createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	createInfo.presentMode = presentMode;
+	createInfo.clipped = VK_TRUE;
+
+	if (vkCreateSwapchainKHR(vDevice->device, &createInfo, nullptr, &swapChain) != VK_SUCCESS)
+		throw std::runtime_error("failed to create swap chain!");
+
+	vkGetSwapchainImagesKHR(vDevice->device, swapChain, &imageCount, nullptr);
+	swapChainImages.resize(imageCount);
+	vkGetSwapchainImagesKHR(vDevice->device, swapChain, &imageCount, swapChainImages.data());
+	swapChainImageFormat = surfaceFormat.format;
+	swapChainExtent = extent;
+}
+
+void VulkanContext::createImageViews()
+{
+	swapChainImageViews.resize(swapChainImages.size());
+	for (size_t i = 0; i < swapChainImages.size(); i++)
+	{
+		VkImageViewCreateInfo createInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr, 0, swapChainImages[i], VK_IMAGE_VIEW_TYPE_2D, swapChainImageFormat};
+		createInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+		createInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		if (vkCreateImageView(vDevice->device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS)
+			throw std::runtime_error("failed to create image views!");
+	}
+}
+
+void VulkanContext::createRenderPass()
+{
+	VkAttachmentDescription colorAttachment{};
+	colorAttachment.format = swapChainImageFormat;
+	colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	// 修复：必须声明为 UNDEFINED，交由 RenderPass 在执行时转移
+	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+	VkAttachmentReference colorAttachmentRef{};
+	colorAttachmentRef.attachment = 0;
+	colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkSubpassDescription subpass{};
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorAttachmentRef;
+
+	VkSubpassDependency dependency{};
+	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependency.dstSubpass = 0;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	dependency.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+
+	VkRenderPassCreateInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, nullptr, 0, 1, &colorAttachment, 1, &subpass, 1, &dependency};
+	if (vkCreateRenderPass(vDevice->device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS)
+		throw std::runtime_error("failed to create render pass!");
+}
+
+void VulkanContext::createFramebuffers()
+{
+	swapChainFramebuffers.resize(swapChainImageViews.size());
+	for (size_t i = 0; i < swapChainImageViews.size(); i++)
+	{
+		VkImageView attachments[] = {swapChainImageViews[i]};
+		VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, nullptr, 0, renderPass, 1, attachments, swapChainExtent.width, swapChainExtent.height, 1};
+		if (vkCreateFramebuffer(vDevice->device, &framebufferInfo, nullptr, &swapChainFramebuffers[i]) != VK_SUCCESS)
+			throw std::runtime_error("failed to create framebuffer!");
+	}
+}
+
+void VulkanContext::createCommandBuffers()
+{
+	commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+	VkCommandBufferAllocateInfo allocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, vDevice->commandPool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, static_cast<uint32_t>(commandBuffers.size())};
+	if (vkAllocateCommandBuffers(vDevice->device, &allocInfo, commandBuffers.data()) != VK_SUCCESS)
+		throw std::runtime_error("failed to allocate command buffers!");
+}
+
+void VulkanContext::createSyncObjects()
+{
+	imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+	renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+	inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+
+	VkSemaphoreCreateInfo semaphoreInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, nullptr, 0};
+	VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
+
+	for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+	{
+		if (vkCreateSemaphore(vDevice->device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
+		    vkCreateSemaphore(vDevice->device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS ||
+		    vkCreateFence(vDevice->device, &fenceInfo, nullptr, &inFlightFences[i]) != VK_SUCCESS)
+		{
+			throw std::runtime_error("failed to create sync objects for a frame!");
+		}
+	}
+}
+```
+
+src/ImGuiLayer.h:
+```
+#pragma once
+#include "VulkanDevice.h"
+#include "VulkanContext.h"
+
+class ImGuiLayer
+{
+public:
+	void init(VulkanDevice *device, VulkanContext *context, GLFWwindow *window);
+	void cleanup();
+
+	void beginFrame();
+	void render(VkCommandBuffer commandBuffer);
+
+private:
+	void createDescriptorPool();
+
+	VulkanDevice *vDevice = nullptr;
+	VkDescriptorPool imguiPool = VK_NULL_HANDLE;
+};
+```
+
+src/ImGuiLayer.cpp:
+```
+#include "ImGuiLayer.h"
+#include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_vulkan.h>
+#include <stdexcept>
+
+void ImGuiLayer::init(VulkanDevice *device, VulkanContext *context, GLFWwindow *window)
+{
+	vDevice = device;
+	createDescriptorPool();
+
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGuiIO &io = ImGui::GetIO();
+	(void)io;
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+	ImGui::StyleColorsDark();
+
+	ImGui_ImplGlfw_InitForVulkan(window, true);
+
+	ImGui_ImplVulkan_InitInfo initInfo = {};
+	initInfo.Instance = vDevice->instance;
+	initInfo.PhysicalDevice = vDevice->physicalDevice;
+	initInfo.Device = vDevice->device;
+	initInfo.QueueFamily = vDevice->findQueueFamilies(vDevice->physicalDevice).graphicsFamily.value();
+	initInfo.Queue = vDevice->graphicsQueue;
+	initInfo.PipelineCache = VK_NULL_HANDLE;
+	initInfo.DescriptorPool = imguiPool;
+	initInfo.MinImageCount = VulkanContext::MAX_FRAMES_IN_FLIGHT;
+	initInfo.ImageCount = VulkanContext::MAX_FRAMES_IN_FLIGHT;
+	initInfo.Allocator = nullptr;
+	initInfo.CheckVkResultFn = [](VkResult err)
+	{
+		if (err != VK_SUCCESS)
+			throw std::runtime_error("ImGui Vulkan Error");
+	};
+
+	// 适配最新版 API 结构：将渲染通道与多重采样设置移入 PipelineInfoMain
+	initInfo.PipelineInfoMain.RenderPass = context->getRenderPass();
+	initInfo.PipelineInfoMain.Subpass = 0;
+	initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+
+	// 适配最新版函数签名：只传入 initInfo 指针
+	ImGui_ImplVulkan_Init(&initInfo);
+
+	// uploadFonts() 已被弃用，直接移除即可
+}
+
+void ImGuiLayer::createDescriptorPool()
+{
+	VkDescriptorPoolSize poolSizes[] = {
+	    {VK_DESCRIPTOR_TYPE_SAMPLER, 1000},
+	    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
+	    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000},
+	    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000},
+	    {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000},
+	    {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000},
+	    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
+	    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000},
+	    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000},
+	    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000},
+	    {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000}};
+
+	VkDescriptorPoolCreateInfo poolInfo = {};
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+	poolInfo.maxSets = 1000;
+	poolInfo.poolSizeCount = static_cast<uint32_t>(std::size(poolSizes));
+	poolInfo.pPoolSizes = poolSizes;
+
+	if (vkCreateDescriptorPool(vDevice->device, &poolInfo, nullptr, &imguiPool) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create ImGui descriptor pool!");
+	}
+}
+
+void ImGuiLayer::cleanup()
+{
+	vkDeviceWaitIdle(vDevice->device);
+	ImGui_ImplVulkan_Shutdown();
+	ImGui_ImplGlfw_Shutdown();
+	ImGui::DestroyContext();
+	vkDestroyDescriptorPool(vDevice->device, imguiPool, nullptr);
+}
+
+void ImGuiLayer::beginFrame()
+{
+	ImGui_ImplVulkan_NewFrame();
+	ImGui_ImplGlfw_NewFrame();
+	ImGui::NewFrame();
+}
+
+void ImGuiLayer::render(VkCommandBuffer commandBuffer)
+{
+	ImGui::Render();
+	ImDrawData *drawData = ImGui::GetDrawData();
+	ImGui_ImplVulkan_RenderDrawData(drawData, commandBuffer);
+}
+```
+
+src/main.cpp:
+```
+#include "Application.h"
+#include <iostream>
+#include <cstdlib>
+#include <stdexcept>
+
+int main()
+{
+	Application app;
+	try
+	{
+		app.run();
+	}
+	catch (const std::exception &e)
+	{
+		std::cerr << "Fatal Error: " << e.what() << std::endl;
+		return EXIT_FAILURE;
+	}
+	return EXIT_SUCCESS;
+}
+```
+
+src/ASBuilder.h:
+```
+#pragma once
+#include "VulkanDevice.h"
+#include <vector>
+#include <vulkan/vulkan.h>
+
+// 封装单个加速结构及其关联内存
+struct VulkanAS
+{
+	VkAccelerationStructureKHR handle = VK_NULL_HANDLE;
+	AllocatedBuffer buffer;
+	VkDeviceAddress deviceAddress = 0;
+};
+
+// 描述一个输入给 BLAS 的几何体（目前支持三角形网格）
+struct BlasInput
+{
+	std::vector<VkAccelerationStructureGeometryKHR> asGeometry;
+	std::vector<VkAccelerationStructureBuildRangeInfoKHR> asBuildOffsetInfo;
+	VkBuildAccelerationStructureFlagsKHR flags{0};
+};
+
+class ASBuilder
+{
+public:
+	void init(VulkanDevice *device);
+	void cleanup();
+
+	void buildScene(const SceneData &scene, AllocatedBuffer vertexBuffer, AllocatedBuffer indexBuffer);
+
+	const std::vector<VulkanAS> &getBLAS() const { return blasArray; }
+	const VulkanAS &getTLAS() const { return tlas; }
+
+private:
+	VulkanDevice *vDevice = nullptr;
+
+	std::vector<VulkanAS> blasArray;
+	VulkanAS tlas;
+
+	VulkanAS createAccelerationStructure(VkAccelerationStructureCreateInfoKHR &createInfo);
+	AllocatedBuffer createScratchBuffer(VkDeviceSize size);
+	void buildBLAS(const std::vector<BlasInput> &input, VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR);
+	void buildTLAS(const std::vector<VkAccelerationStructureInstanceKHR> &instances, VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR);
+};
+```
+
+src/ASBuilder.cpp:
+```
+#include "ASBuilder.h"
+#include <stdexcept>
+#include <cstring>
+
+void ASBuilder::init(VulkanDevice *device)
+{
+	vDevice = device;
+}
+
+void ASBuilder::cleanup()
+{
+	for (auto &blas : blasArray)
+	{
+		if (blas.handle != VK_NULL_HANDLE)
+		{
+			vDevice->vkDestroyAccelerationStructureKHR(vDevice->device, blas.handle, nullptr);
+			vDevice->destroyBuffer(blas.buffer);
+		}
+	}
+	blasArray.clear();
+
+	if (tlas.handle != VK_NULL_HANDLE)
+	{
+		vDevice->vkDestroyAccelerationStructureKHR(vDevice->device, tlas.handle, nullptr);
+		vDevice->destroyBuffer(tlas.buffer);
+	}
+}
+
+VulkanAS ASBuilder::createAccelerationStructure(VkAccelerationStructureCreateInfoKHR &createInfo)
+{
+	VulkanAS as;
+	// 为 AS 分配专门的显存，必须使用 ACCELERATION_STRUCTURE_STORAGE 标志
+	as.buffer = vDevice->createBuffer(createInfo.size,
+					  VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+					  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+	createInfo.buffer = as.buffer.buffer;
+
+	if (vDevice->vkCreateAccelerationStructureKHR(vDevice->device, &createInfo, nullptr, &as.handle) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create acceleration structure!");
+	}
+
+	// 获取 AS 的设备地址，供着色器和 TLAS 引用
+	VkAccelerationStructureDeviceAddressInfoKHR addressInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+	addressInfo.accelerationStructure = as.handle;
+	as.deviceAddress = vDevice->vkGetAccelerationStructureDeviceAddressKHR(vDevice->device, &addressInfo);
+
+	return as;
+}
+
+AllocatedBuffer ASBuilder::createScratchBuffer(VkDeviceSize size)
+{
+	return vDevice->createBuffer(size,
+				     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+				     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
+
+void ASBuilder::buildBLAS(const std::vector<BlasInput> &inputs, VkBuildAccelerationStructureFlagsKHR flags)
+{
+	uint32_t nbBlas = static_cast<uint32_t>(inputs.size());
+	VkDeviceSize maxScratchSize = 0;
+
+	std::vector<VkAccelerationStructureBuildGeometryInfoKHR> buildInfos(nbBlas);
+	std::vector<VkDeviceSize> originalSizes(nbBlas);
+
+	// 1. 获取每个 BLAS 构建所需的显存大小
+	for (uint32_t idx = 0; idx < nbBlas; idx++)
+	{
+		buildInfos[idx].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+		buildInfos[idx].type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+		buildInfos[idx].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+		buildInfos[idx].flags = inputs[idx].flags | flags;
+		buildInfos[idx].geometryCount = static_cast<uint32_t>(inputs[idx].asGeometry.size());
+		buildInfos[idx].pGeometries = inputs[idx].asGeometry.data();
+
+		std::vector<uint32_t> maxPrimCount(inputs[idx].asBuildOffsetInfo.size());
+		for (auto tt = 0; tt < inputs[idx].asBuildOffsetInfo.size(); tt++)
+		{
+			maxPrimCount[tt] = inputs[idx].asBuildOffsetInfo[tt].primitiveCount;
+		}
+
+		VkAccelerationStructureBuildSizesInfoKHR sizeInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+		vDevice->vkGetAccelerationStructureBuildSizesKHR(vDevice->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfos[idx], maxPrimCount.data(), &sizeInfo);
+
+		originalSizes[idx] = sizeInfo.accelerationStructureSize;
+		maxScratchSize = std::max(maxScratchSize, sizeInfo.buildScratchSize);
+	}
+
+	// 2. 分配 Scratch Buffer (临时构建内存)
+	AllocatedBuffer scratchBuffer = createScratchBuffer(maxScratchSize);
+	VkDeviceAddress scratchAddress = scratchBuffer.deviceAddress;
+
+	// 3. 实际创建 AS 并记录构建命令
+	blasArray.resize(nbBlas);
+	VkCommandBuffer cmdBuf = vDevice->beginSingleTimeCommands();
+
+	for (uint32_t idx = 0; idx < nbBlas; idx++)
+	{
+		VkAccelerationStructureCreateInfoKHR createInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+		createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+		createInfo.size = originalSizes[idx];
+		blasArray[idx] = createAccelerationStructure(createInfo);
+
+		buildInfos[idx].dstAccelerationStructure = blasArray[idx].handle;
+		buildInfos[idx].scratchData.deviceAddress = scratchAddress;
+
+		const VkAccelerationStructureBuildRangeInfoKHR *pBuildOffset = inputs[idx].asBuildOffsetInfo.data();
+		vDevice->vkCmdBuildAccelerationStructuresKHR(cmdBuf, 1, &buildInfos[idx], &pBuildOffset);
+
+		// 插入内存屏障，确保当前 BLAS 构建完成才能被后续过程（或 TLAS）使用
+		VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+		barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+		barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+		vkCmdPipelineBarrier(cmdBuf, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+	}
+
+	vDevice->endSingleTimeCommands(cmdBuf);
+	vDevice->destroyBuffer(scratchBuffer); // 释放临时内存，防止泄漏
+}
+
+void ASBuilder::buildTLAS(const std::vector<VkAccelerationStructureInstanceKHR> &instances, VkBuildAccelerationStructureFlagsKHR flags)
+{
+	if (instances.empty())
+		return;
+
+	// 1. 创建并上传实例缓冲区
+	VkDeviceSize instanceBufferSize = instances.size() * sizeof(VkAccelerationStructureInstanceKHR);
+	AllocatedBuffer instanceBuffer = vDevice->createBuffer(instanceBufferSize,
+							       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+							       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	void *data;
+	vkMapMemory(vDevice->device, instanceBuffer.memory, 0, instanceBufferSize, 0, &data);
+	memcpy(data, instances.data(), instanceBufferSize);
+	vkUnmapMemory(vDevice->device, instanceBuffer.memory);
+
+	// 2. 准备 TLAS 构建信息
+	VkAccelerationStructureGeometryInstancesDataKHR instancesVk{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR};
+	instancesVk.data.deviceAddress = instanceBuffer.deviceAddress;
+
+	VkAccelerationStructureGeometryKHR topASGeometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+	topASGeometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+	topASGeometry.geometry.instances = instancesVk;
+
+	VkAccelerationStructureBuildGeometryInfoKHR buildInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+	buildInfo.flags = flags;
+	buildInfo.geometryCount = 1;
+	buildInfo.pGeometries = &topASGeometry;
+	buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+
+	uint32_t count = static_cast<uint32_t>(instances.size());
+	VkAccelerationStructureBuildSizesInfoKHR sizeInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+	vDevice->vkGetAccelerationStructureBuildSizesKHR(vDevice->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo, &count, &sizeInfo);
+
+	// 3. 创建 TLAS 对象与 Scratch Buffer
+	VkAccelerationStructureCreateInfoKHR createInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+	createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+	createInfo.size = sizeInfo.accelerationStructureSize;
+	tlas = createAccelerationStructure(createInfo);
+
+	AllocatedBuffer scratchBuffer = createScratchBuffer(sizeInfo.buildScratchSize);
+
+	buildInfo.dstAccelerationStructure = tlas.handle;
+	buildInfo.scratchData.deviceAddress = scratchBuffer.deviceAddress;
+
+	// 4. 记录构建命令
+	VkAccelerationStructureBuildRangeInfoKHR buildOffsetInfo{count, 0, 0, 0};
+	const VkAccelerationStructureBuildRangeInfoKHR *pBuildOffsetInfo = &buildOffsetInfo;
+
+	VkCommandBuffer cmdBuf = vDevice->beginSingleTimeCommands();
+	vDevice->vkCmdBuildAccelerationStructuresKHR(cmdBuf, 1, &buildInfo, &pBuildOffsetInfo);
+	vDevice->endSingleTimeCommands(cmdBuf);
+
+	// 5. 清理临时资源
+	vDevice->destroyBuffer(scratchBuffer);
+	vDevice->destroyBuffer(instanceBuffer);
+}
+
+void ASBuilder::buildScene(const SceneData &scene, AllocatedBuffer vertexBuffer, AllocatedBuffer indexBuffer)
+{
+	if (scene.subMeshes.empty())
+		return;
+
+	// 1. 为每个 SubMesh 准备 BLAS 构建信息
+	std::vector<BlasInput> blasInputs;
+	blasInputs.reserve(scene.subMeshes.size());
+
+	for (const auto &subMesh : scene.subMeshes)
+	{
+		VkAccelerationStructureGeometryTrianglesDataKHR triangles{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
+		triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+		triangles.vertexData.deviceAddress = vertexBuffer.deviceAddress; // 使用同一块全局显存
+		triangles.vertexStride = sizeof(Vertex);
+		triangles.maxVertex = static_cast<uint32_t>(scene.vertices.size() - 1);
+		triangles.indexType = VK_INDEX_TYPE_UINT32;
+		triangles.indexData.deviceAddress = indexBuffer.deviceAddress; // 同上
+
+		VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+		geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+		geometry.geometry.triangles = triangles;
+		geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+
+		VkAccelerationStructureBuildRangeInfoKHR offset{};
+		// 注意：通过偏移定位到这个 SubMesh 在大数组中的精确位置
+		offset.primitiveCount = subMesh.indexCount / 3;
+		offset.primitiveOffset = subMesh.firstIndex * sizeof(uint32_t);
+		offset.firstVertex = subMesh.vertexOffset;
+		offset.transformOffset = 0;
+
+		BlasInput input;
+		input.asGeometry.push_back(geometry);
+		input.asBuildOffsetInfo.push_back(offset);
+		input.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+		blasInputs.push_back(input);
+	}
+
+	// 2. 批量构建 BLAS
+	buildBLAS(blasInputs);
+
+	// 3. 将 SceneInstance 映射为 Vulkan 实例数据
+	std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
+	tlasInstances.reserve(scene.instances.size());
+
+	for (uint32_t i = 0; i < scene.instances.size(); ++i)
+	{
+		const auto &inst = scene.instances[i];
+
+		// glm::mat4 是列主序，Vulkan AS 实例需要行主序的 3x4 矩阵
+		glm::mat4 transposed = glm::transpose(inst.transform);
+
+		VkAccelerationStructureInstanceKHR vkInst{};
+		memcpy(&vkInst.transform, &transposed, sizeof(VkTransformMatrixKHR));
+
+		vkInst.instanceCustomIndex = inst.subMeshIndex; // 将 subMeshIndex 编码入自定义索引，着色器解包使用
+		vkInst.mask = 0xFF;
+		vkInst.instanceShaderBindingTableRecordOffset = 0;
+		vkInst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+		// 绑定对应的 BLAS
+		vkInst.accelerationStructureReference = blasArray[inst.subMeshIndex].deviceAddress;
+
+		tlasInstances.push_back(vkInst);
+	}
+
+	// 4. 构建 TLAS
+	buildTLAS(tlasInstances);
+}
+```
+
+src/Types.h:
+```
+#pragma once
+#include <vulkan/vulkan.h>
+#include <glm/glm.hpp>
+
+// 1. 显存资源分配封装
+struct AllocatedBuffer
+{
+	VkBuffer buffer = VK_NULL_HANDLE;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	VkDeviceAddress deviceAddress = 0;
+};
+
+struct AllocatedImage
+{
+	VkImage image = VK_NULL_HANDLE;
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	VkImageView view = VK_NULL_HANDLE;
+	VkFormat format = VK_FORMAT_UNDEFINED;
+	VkExtent3D extent = {0, 0, 0};
+};
+
+// 2. 场景几何体基础单元
+struct Vertex
+{
+	glm::vec3 pos;
+	glm::vec3 normal;
+	glm::vec2 uv;
+};
+
+// 用于 UI 和主循环共享的状态配置，隔离 UI 渲染与底层逻辑
+struct SceneConfig
+{
+	glm::vec3 envColor = {0.5f, 0.7f, 1.0f};
+	float envIntensity = 1.0f;
+
+	glm::vec3 lightDirection = glm::normalize(glm::vec3(0.5f, 1.0f, -0.5f));
+	glm::vec3 lightColor = {1.0f, 0.95f, 0.9f};
+	float lightIntensity = 5.0f;
+	float lightAngleRadius = glm::radians(2.0f);
+
+	// 全局材质调试覆盖参数
+	bool overrideMaterial = true;
+	glm::vec3 albedo = {1.0f, 1.0f, 1.0f};
+	float roughness = 0.05f;
+	float metallic = 0.0f;
+	float transmission = 1.0f;
+	float ior = 1.5f;
+
+	bool isDirty = true;
+};
+
+// 3. 全局推送常量 (每帧更新的管线参数)
+// 严格控制在 128 字节内 (Vulkan 最低保证标准)
+struct PushConstants
+{
+	glm::vec4 camPos_Fov;	   // xyz: pos, w: fov (tan(fov/2))
+	glm::vec4 camDir_Aspect;   // xyz: dir, w: aspect
+	glm::vec4 camUp_Frame;	   // xyz: up,  w: frameCount
+	glm::vec4 camRight_EnvInt; // xyz: right, w: envIntensity
+	glm::vec4 envColor_LgAng;  // xyz: envColor, w: lightAngle
+	glm::vec4 lightDir_LgInt;  // xyz: lightDir, w: lightIntensity
+	glm::vec4 albedo_Rough;	   // xyz: albedo, w: roughness
+	glm::vec4 matParams;	   // x: metallic, y: transmission, z: ior, w: overrideMode
+};
+
+struct GPUMaterial
+{
+	glm::vec4 baseColor;
+	float metallic;
+	float roughness;
+	float transmission; // 0.0: 不透明, 1.0: 全透明玻璃
+	float ior;	    // 折射率 (如玻璃 1.5, 水 1.33)
+	int textureID;
+	int padding[3]; // 保持 16 字节对齐
+};
+
+struct SubMesh
+{
+	uint32_t firstIndex;
+	uint32_t indexCount;
+	int32_t vertexOffset;
+	uint32_t materialIndex;
+};
+
+struct InstanceData
+{
+	glm::mat4 transform;
+	uint32_t subMeshIndex;
+};
+
+// 场景的纯数据容器，由 ModelLoader 产出，供管线消费
+struct SceneData
+{
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
+	std::vector<GPUMaterial> materials;
+	std::vector<SubMesh> subMeshes;
+	std::vector<InstanceData> instances;
+};
+```
+
+src/BufferManager.h:
+```
+#pragma once
+#include "VulkanDevice.h"
+#include <vector>
+#include "Types.h"
+
+class BufferManager
+{
+public:
+	void init(VulkanDevice *device);
+
+	// 核心通用上传函数：使用 Staging Buffer 将 CPU 数据推送到 GPU Device Local 内存
+	AllocatedBuffer createDeviceLocalBuffer(const void *data, VkDeviceSize size, VkBufferUsageFlags usage);
+
+	// 针对光追几何体的特化上传
+	AllocatedBuffer createVertexBuffer(const std::vector<Vertex> &vertices);
+	AllocatedBuffer createIndexBuffer(const std::vector<uint32_t> &indices);
+
+private:
+	VulkanDevice *vDevice = nullptr;
+
+	void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
+};
+```
+
+src/BufferManager.cpp:
+```
+#include "BufferManager.h"
+#include <cstring>
+#include <stdexcept>
+
+void BufferManager::init(VulkanDevice *device)
+{
+	vDevice = device;
+}
+
+void BufferManager::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
+{
+	VkCommandBuffer commandBuffer = vDevice->beginSingleTimeCommands();
+
+	VkBufferCopy copyRegion{};
+	copyRegion.srcOffset = 0;
+	copyRegion.dstOffset = 0;
+	copyRegion.size = size;
+	vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+	vDevice->endSingleTimeCommands(commandBuffer);
+}
+
+AllocatedBuffer BufferManager::createDeviceLocalBuffer(const void *data, VkDeviceSize size, VkBufferUsageFlags usage)
+{
+	// 1. 创建 CPU 可见的暂存缓冲区 (Staging Buffer)
+	AllocatedBuffer stagingBuffer = vDevice->createBuffer(
+	    size,
+	    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	// 2. 将数据映射并拷贝到暂存缓冲区
+	void *mappedData;
+	vkMapMemory(vDevice->device, stagingBuffer.memory, 0, size, 0, &mappedData);
+	memcpy(mappedData, data, static_cast<size_t>(size));
+	vkUnmapMemory(vDevice->device, stagingBuffer.memory);
+
+	// 3. 创建 GPU 专用的目标缓冲区 (Device Local)
+	// 强制附加 SHADER_DEVICE_ADDRESS_BIT，因为光追的 AS 构建和 Shader 都需要直接通过指针访问显存
+	AllocatedBuffer deviceBuffer = vDevice->createBuffer(
+	    size,
+	    usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+	    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+	// 4. 提交拷贝命令
+	copyBuffer(stagingBuffer.buffer, deviceBuffer.buffer, size);
+
+	// 5. 释放暂存缓冲区
+	vDevice->destroyBuffer(stagingBuffer);
+
+	return deviceBuffer;
+}
+
+AllocatedBuffer BufferManager::createVertexBuffer(const std::vector<Vertex> &vertices)
+{
+	VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+	return createDeviceLocalBuffer(
+	    vertices.data(),
+	    bufferSize,
+	    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+}
+
+AllocatedBuffer BufferManager::createIndexBuffer(const std::vector<uint32_t> &indices)
+{
+	VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+	return createDeviceLocalBuffer(
+	    indices.data(),
+	    bufferSize,
+	    VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+}
+```
+
+src/ImageManager.h:
+```
+#pragma once
+#include "VulkanDevice.h"
+#include "Types.h"
+
+class ImageManager
+{
+public:
+	void init(VulkanDevice *device);
+
+	AllocatedImage createStorageImage(uint32_t width, uint32_t height, VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT);
+	void destroyImage(const AllocatedImage &allocatedImage);
+
+	// 单次指令屏障 (用于初始化)
+	void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout);
+
+	// 录制到当前帧 CommandBuffer 的屏障与拷贝指令
+	void cmdTransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout);
+	void cmdBlitImage(VkCommandBuffer cmd, VkImage srcImage, VkImage dstImage, uint32_t width, uint32_t height);
+
+private:
+	VulkanDevice *vDevice = nullptr;
+};
+```
+
+src/ImageManager.cpp:
+```
+#include "ImageManager.h"
+#include <stdexcept>
+
+void ImageManager::init(VulkanDevice *device)
+{
+	vDevice = device;
+}
+
+AllocatedImage ImageManager::createStorageImage(uint32_t width, uint32_t height, VkFormat format)
+{
+	AllocatedImage result;
+	result.format = format;
+	result.extent = {width, height, 1};
+
+	VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.extent = result.extent;
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.format = format;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+	if (vkCreateImage(vDevice->device, &imageInfo, nullptr, &result.image) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create storage image!");
+	}
+
+	VkMemoryRequirements memRequirements;
+	vkGetImageMemoryRequirements(vDevice->device, result.image, &memRequirements);
+
+	VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+	allocInfo.allocationSize = memRequirements.size;
+	allocInfo.memoryTypeIndex = vDevice->findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+	if (vkAllocateMemory(vDevice->device, &allocInfo, nullptr, &result.memory) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to allocate image memory!");
+	}
+	vkBindImageMemory(vDevice->device, result.image, result.memory, 0);
+
+	VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+	viewInfo.image = result.image;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = format;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.baseMipLevel = 0;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.baseArrayLayer = 0;
+	viewInfo.subresourceRange.layerCount = 1;
+
+	if (vkCreateImageView(vDevice->device, &viewInfo, nullptr, &result.view) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create image view!");
+	}
+
+	transitionImageLayout(result.image, format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+	return result;
+}
+
+void ImageManager::destroyImage(const AllocatedImage &allocatedImage)
+{
+	if (allocatedImage.view != VK_NULL_HANDLE)
+	{
+		vkDestroyImageView(vDevice->device, allocatedImage.view, nullptr);
+	}
+	if (allocatedImage.image != VK_NULL_HANDLE)
+	{
+		vkDestroyImage(vDevice->device, allocatedImage.image, nullptr);
+		vkFreeMemory(vDevice->device, allocatedImage.memory, nullptr);
+	}
+}
+
+void ImageManager::transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout)
+{
+	VkCommandBuffer commandBuffer = vDevice->beginSingleTimeCommands();
+	cmdTransitionImageLayout(commandBuffer, image, oldLayout, newLayout);
+	vDevice->endSingleTimeCommands(commandBuffer);
+}
+
+void ImageManager::cmdTransitionImageLayout(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout)
+{
+	VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.baseMipLevel = 0;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.baseArrayLayer = 0;
+	barrier.subresourceRange.layerCount = 1;
+
+	VkPipelineStageFlags sourceStage;
+	VkPipelineStageFlags destinationStage;
+
+	if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_GENERAL)
+	{
+		barrier.srcAccessMask = 0;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		destinationStage = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+	}
+	else if (oldLayout == VK_IMAGE_LAYOUT_GENERAL && newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+	{
+		barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		sourceStage = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+		destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	}
+	else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_GENERAL)
+	{
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+		destinationStage = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+	}
+	else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+	{
+		barrier.srcAccessMask = 0;
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	}
+	else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+	{
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+		sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+		destinationStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	}
+	else
+	{
+		throw std::invalid_argument("unsupported layout transition in cmdTransitionImageLayout!");
+	}
+
+	vkCmdPipelineBarrier(cmd, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void ImageManager::cmdBlitImage(VkCommandBuffer cmd, VkImage srcImage, VkImage dstImage, uint32_t width, uint32_t height)
+{
+	VkImageBlit blit{};
+	blit.srcOffsets[0] = {0, 0, 0};
+	blit.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+	blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	blit.srcSubresource.mipLevel = 0;
+	blit.srcSubresource.baseArrayLayer = 0;
+	blit.srcSubresource.layerCount = 1;
+
+	blit.dstOffsets[0] = {0, 0, 0};
+	blit.dstOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
+	blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	blit.dstSubresource.mipLevel = 0;
+	blit.dstSubresource.baseArrayLayer = 0;
+	blit.dstSubresource.layerCount = 1;
+
+	vkCmdBlitImage(cmd,
+		       srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		       dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		       1, &blit,
+		       VK_FILTER_NEAREST);
+}
+```
+
+src/DescriptorManager.h:
+```
+#pragma once
+#include "VulkanDevice.h"
+#include <vector>
+
+class DescriptorManager
+{
+public:
+	// maxSets: 预估应用运行期间最大需要的描述符集数量
+	void init(VulkanDevice *device, uint32_t maxSets = 100);
+	void cleanup();
+
+	// 传入绑定配置，自动生成 Layout（Manager 会接管其生命周期用于销毁）
+	VkDescriptorSetLayout createLayout(const std::vector<VkDescriptorSetLayoutBinding> &bindings);
+
+	// 从内部 Pool 分配 Descriptor Set
+	VkDescriptorSet allocateSet(VkDescriptorSetLayout layout);
+
+	// 批量更新 Descriptor Set 的内容
+	void updateSet(const std::vector<VkWriteDescriptorSet> &writes);
+
+private:
+	VulkanDevice *vDevice = nullptr;
+	VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+
+	// 集中管理，防止外部忘记销毁导致泄漏
+	std::vector<VkDescriptorSetLayout> trackedLayouts;
+};
+```
+
+src/DescriptorManager.cpp:
+```
+#include "DescriptorManager.h"
+#include <stdexcept>
+
+void DescriptorManager::init(VulkanDevice *device, uint32_t maxSets)
+{
+	vDevice = device;
+
+	// 为光追场景配置常用的 Descriptor Type 容量比例
+	std::vector<VkDescriptorPoolSize> poolSizes = {
+	    {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, maxSets}, // 用于 TLAS
+	    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, maxSets},	      // 用于光追输出
+	    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, maxSets},	      // 用于相机/场景参数
+	    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, maxSets}	      // 用于顶点/索引数据的 SSBO 访问
+	};
+
+	VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+	poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+	poolInfo.maxSets = maxSets;
+	poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+	poolInfo.pPoolSizes = poolSizes.data();
+
+	if (vkCreateDescriptorPool(vDevice->device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create descriptor pool!");
+	}
+}
+
+void DescriptorManager::cleanup()
+{
+	for (auto layout : trackedLayouts)
+	{
+		vkDestroyDescriptorSetLayout(vDevice->device, layout, nullptr);
+	}
+	trackedLayouts.clear();
+
+	if (descriptorPool != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorPool(vDevice->device, descriptorPool, nullptr);
+	}
+}
+
+VkDescriptorSetLayout DescriptorManager::createLayout(const std::vector<VkDescriptorSetLayoutBinding> &bindings)
+{
+	VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+	layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+	layoutInfo.pBindings = bindings.data();
+
+	VkDescriptorSetLayout layout;
+	if (vkCreateDescriptorSetLayout(vDevice->device, &layoutInfo, nullptr, &layout) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create descriptor set layout!");
+	}
+
+	trackedLayouts.push_back(layout);
+	return layout;
+}
+
+VkDescriptorSet DescriptorManager::allocateSet(VkDescriptorSetLayout layout)
+{
+	VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+	allocInfo.descriptorPool = descriptorPool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts = &layout;
+
+	VkDescriptorSet descriptorSet;
+	if (vkAllocateDescriptorSets(vDevice->device, &allocInfo, &descriptorSet) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to allocate descriptor set!");
+	}
+	return descriptorSet;
+}
+
+void DescriptorManager::updateSet(const std::vector<VkWriteDescriptorSet> &writes)
+{
+	vkUpdateDescriptorSets(vDevice->device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+```
+
+src/Application.h:
+```
+#pragma once
+
+#include <GLFW/glfw3.h>
+#include <vector>
+#include <stdexcept>
+#include <memory>
+
+#include "VulkanDevice.h"
+#include "VulkanContext.h"
+#include "ImGuiLayer.h"
+#include "BufferManager.h"
+#include "ASBuilder.h"
+#include "ImageManager.h"
+#include "DescriptorManager.h"
+#include "RTPipeline.h"
+#include "Types.h"
+#include "Camera.h"
+#include "SettingsPanel.h"
+#include "ModelLoader.h"
+
+class Application
+{
+public:
+	void run();
+
+private:
+	GLFWwindow *window = nullptr;
+	VulkanDevice vDevice;
+	VulkanContext vContext;
+	ImGuiLayer imGuiLayer;
+
+	BufferManager bufferManager;
+	ASBuilder asBuilder;
+	ImageManager imageManager;
+	DescriptorManager descriptorManager;
+	RTPipeline rtPipeline;
+	ModelLoader modelLoader;
+
+	// 场景数据容器
+	SceneData sceneData;
+
+	// 几何与材质资源
+	AllocatedBuffer vertexBuffer;
+	AllocatedBuffer indexBuffer;
+	AllocatedBuffer materialBuffer;
+	AllocatedBuffer subMeshBuffer;
+
+	AllocatedImage storageImage;
+	VkDescriptorSetLayout rtDescriptorSetLayout = VK_NULL_HANDLE;
+	VkDescriptorSet rtDescriptorSet = VK_NULL_HANDLE;
+
+	SceneConfig sceneConfig;
+	std::vector<std::unique_ptr<UIPanel>> uiPanels;
+
+	uint32_t width = 1280;
+	uint32_t height = 720;
+	bool framebufferResized = false;
+	uint32_t frameCount = 0;
+
+	Camera camera;
+	float lastFrameTime = 0.0f;
+
+	static void framebufferResizeCallback(GLFWwindow *window, int width, int height);
+
+	void initWindow();
+	void initVulkan();
+	void loadScene();
+	void createStorageImage();
+	void createDescriptors();
+	void updateDescriptors();
+	void handleResize();
+	void mainLoop();
+	void cleanup();
+};
+```
+
+src/Application.cpp:
+```
+#include "Application.h"
+#include <imgui.h>
+#include <iostream>
+
+void Application::framebufferResizeCallback(GLFWwindow *window, int width, int height)
+{
+	auto app = reinterpret_cast<Application *>(glfwGetWindowUserPointer(window));
+	app->framebufferResized = true;
+}
+
+void Application::run()
+{
+	initWindow();
+	initVulkan();
+	mainLoop();
+	cleanup();
+}
+
+void Application::initWindow()
+{
+	if (!glfwInit())
+		throw std::runtime_error("failed to initialize GLFW");
+
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	window = glfwCreateWindow(width, height, "Vulkan RT Engine Test", nullptr, nullptr);
+	glfwSetWindowUserPointer(window, this);
+	glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+}
+
+void Application::initVulkan()
+{
+	vDevice.init(window);
+	vContext.init(&vDevice, window);
+	imGuiLayer.init(&vDevice, &vContext, window);
+
+	bufferManager.init(&vDevice);
+	asBuilder.init(&vDevice);
+	imageManager.init(&vDevice);
+	descriptorManager.init(&vDevice);
+
+	uiPanels.push_back(std::make_unique<SettingsPanel>(&sceneConfig));
+
+	loadScene();
+	createStorageImage();
+	createDescriptors();
+
+	rtPipeline.init(&vDevice, rtDescriptorSetLayout);
+	camera.init(glm::vec3(0.0f, 1.0f, -3.0f));
+}
+
+void Application::loadScene()
+{
+	// 尝试加载外部模型，如果失败则回退到硬编码三角形防止崩溃
+	// 请确保可执行文件同级目录下有 models/test.glb 文件
+	if (!modelLoader.loadGLTF("models/test.glb", sceneData))
+	{
+		std::cout << "Warning: Could not load models/test.glb, generating default triangle.\n";
+
+		sceneData.vertices = {
+		    {{0.0f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.5f, 0.0f}},
+		    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+		    {{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}}};
+		sceneData.indices = {0, 1, 2};
+		sceneData.materials.push_back({glm::vec4(0.8f, 0.3f, 0.3f, 1.0f), 0.0f, 0.5f, 0.0f, 1.5f, -1, {0, 0, 0}});
+		sceneData.subMeshes.push_back({0, 3, 0, 0});
+		sceneData.instances.push_back({glm::mat4(1.0f), 0});
+	}
+
+	// 1. 上传所有合并后的数组到 GPU
+	vertexBuffer = bufferManager.createDeviceLocalBuffer(sceneData.vertices.data(), sizeof(Vertex) * sceneData.vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+	indexBuffer = bufferManager.createDeviceLocalBuffer(sceneData.indices.data(), sizeof(uint32_t) * sceneData.indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+	materialBuffer = bufferManager.createDeviceLocalBuffer(sceneData.materials.data(), sizeof(GPUMaterial) * sceneData.materials.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+	subMeshBuffer = bufferManager.createDeviceLocalBuffer(sceneData.subMeshes.data(), sizeof(SubMesh) * sceneData.subMeshes.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+	// 2. 将数据交由 ASBuilder 进行批量构建
+	asBuilder.buildScene(sceneData, vertexBuffer, indexBuffer);
+}
+
+void Application::createStorageImage()
+{
+	VkExtent2D extent = vContext.getExtent();
+	storageImage = imageManager.createStorageImage(extent.width, extent.height);
+}
+
+void Application::createDescriptors()
+{
+	std::vector<VkDescriptorSetLayoutBinding> bindings = {
+	    {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr},
+	    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr},
+	    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}, // 顶点
+	    {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}, // 索引
+	    {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}, // SubMeshes
+	    {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}  // Materials
+	};
+	rtDescriptorSetLayout = descriptorManager.createLayout(bindings);
+	rtDescriptorSet = descriptorManager.allocateSet(rtDescriptorSetLayout);
+
+	updateDescriptors();
+}
+
+void Application::updateDescriptors()
+{
+	VkWriteDescriptorSetAccelerationStructureKHR descASInfo{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+	VkAccelerationStructureKHR tlasHandle = asBuilder.getTLAS().handle;
+	descASInfo.accelerationStructureCount = 1;
+	descASInfo.pAccelerationStructures = &tlasHandle;
+
+	VkWriteDescriptorSet asWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+	asWrite.dstSet = rtDescriptorSet;
+	asWrite.dstBinding = 0;
+	asWrite.descriptorCount = 1;
+	asWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	asWrite.pNext = &descASInfo;
+
+	VkDescriptorImageInfo imageInfo{};
+	imageInfo.imageView = storageImage.view;
+	imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+	VkWriteDescriptorSet imageWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+	imageWrite.dstSet = rtDescriptorSet;
+	imageWrite.dstBinding = 1;
+	imageWrite.descriptorCount = 1;
+	imageWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+	imageWrite.pImageInfo = &imageInfo;
+
+	auto createBufferWrite = [](VkDescriptorSet set, uint32_t binding, VkBuffer buffer)
+	{
+		VkDescriptorBufferInfo *info = new VkDescriptorBufferInfo{buffer, 0, VK_WHOLE_SIZE};
+		VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+		write.dstSet = set;
+		write.dstBinding = binding;
+		write.descriptorCount = 1;
+		write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		write.pBufferInfo = info;
+		return write;
+	};
+
+	VkWriteDescriptorSet vertexWrite = createBufferWrite(rtDescriptorSet, 2, vertexBuffer.buffer);
+	VkWriteDescriptorSet indexWrite = createBufferWrite(rtDescriptorSet, 3, indexBuffer.buffer);
+	VkWriteDescriptorSet subMeshWrite = createBufferWrite(rtDescriptorSet, 4, subMeshBuffer.buffer);
+	VkWriteDescriptorSet materialWrite = createBufferWrite(rtDescriptorSet, 5, materialBuffer.buffer);
+
+	descriptorManager.updateSet({asWrite, imageWrite, vertexWrite, indexWrite, subMeshWrite, materialWrite});
+
+	// 释放上面动态分配的临时内存
+	delete vertexWrite.pBufferInfo;
+	delete indexWrite.pBufferInfo;
+	delete subMeshWrite.pBufferInfo;
+	delete materialWrite.pBufferInfo;
+}
+
+void Application::handleResize()
+{
+	vContext.recreateSwapChain();
+
+	imageManager.destroyImage(storageImage);
+	createStorageImage();
+	updateDescriptors();
+
+	frameCount = 0;
+}
+
+void Application::mainLoop()
+{
+	while (!glfwWindowShouldClose(window))
+	{
+		glfwPollEvents();
+
+		float currentFrameTime = static_cast<float>(glfwGetTime());
+		float deltaTime = currentFrameTime - lastFrameTime;
+		lastFrameTime = currentFrameTime;
+
+		if (camera.update(window, deltaTime) || sceneConfig.isDirty)
+		{
+			frameCount = 0;
+			sceneConfig.isDirty = false;
+		}
+
+		uint32_t imageIndex;
+		VkCommandBuffer commandBuffer = vContext.beginFrame(imageIndex);
+
+		if (commandBuffer == VK_NULL_HANDLE)
+		{
+			if (framebufferResized)
+			{
+				framebufferResized = false;
+				handleResize();
+			}
+			continue;
+		}
+
+		PushConstants pc{};
+		pc.camPos_Fov = glm::vec4(camera.getPosition(), tan(glm::radians(camera.getFov() * 0.5f)));
+		pc.camDir_Aspect = glm::vec4(camera.getForward(), (float)vContext.getExtent().width / vContext.getExtent().height);
+		pc.camUp_Frame = glm::vec4(camera.getUp(), static_cast<float>(frameCount++));
+		pc.camRight_EnvInt = glm::vec4(camera.getRight(), sceneConfig.envIntensity);
+
+		pc.envColor_LgAng = glm::vec4(sceneConfig.envColor, sceneConfig.lightAngleRadius);
+		pc.lightDir_LgInt = glm::vec4(sceneConfig.lightDirection, sceneConfig.lightIntensity);
+
+		pc.albedo_Rough = glm::vec4(sceneConfig.albedo, sceneConfig.roughness);
+		pc.matParams = glm::vec4(sceneConfig.metallic, sceneConfig.transmission, sceneConfig.ior, sceneConfig.overrideMaterial ? 1.0f : 0.0f);
+
+		rtPipeline.bind(commandBuffer);
+		rtPipeline.bindDescriptorSets(commandBuffer, &rtDescriptorSet);
+		rtPipeline.pushConstants(commandBuffer, pc);
+		rtPipeline.traceRays(commandBuffer, vContext.getExtent().width, vContext.getExtent().height);
+
+		VkImage swapchainImage = vContext.getSwapChainImage(imageIndex);
+
+		imageManager.cmdTransitionImageLayout(commandBuffer, storageImage.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		imageManager.cmdTransitionImageLayout(commandBuffer, swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+		imageManager.cmdBlitImage(commandBuffer, storageImage.image, swapchainImage, vContext.getExtent().width, vContext.getExtent().height);
+
+		imageManager.cmdTransitionImageLayout(commandBuffer, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		imageManager.cmdTransitionImageLayout(commandBuffer, storageImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+
+		imGuiLayer.beginFrame();
+		for (auto &panel : uiPanels)
+		{
+			panel->draw();
+		}
+
+		VkRenderPassBeginInfo renderPassInfo{};
+		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		renderPassInfo.renderPass = vContext.getRenderPass();
+		renderPassInfo.framebuffer = vContext.getFramebuffer(imageIndex);
+		renderPassInfo.renderArea.offset = {0, 0};
+		renderPassInfo.renderArea.extent = vContext.getExtent();
+
+		vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+		imGuiLayer.render(commandBuffer);
+		vkCmdEndRenderPass(commandBuffer);
+
+		bool needRecreate = vContext.endFrame(commandBuffer, imageIndex);
+		if (needRecreate || framebufferResized)
+		{
+			framebufferResized = false;
+			handleResize();
+		}
+	}
+}
+
+void Application::cleanup()
+{
+	vDevice.deviceWaitIdle();
+
+	rtPipeline.cleanup();
+	imageManager.destroyImage(storageImage);
+	descriptorManager.cleanup();
+
+	asBuilder.cleanup();
+	vDevice.destroyBuffer(vertexBuffer);
+	vDevice.destroyBuffer(indexBuffer);
+	vDevice.destroyBuffer(materialBuffer);
+	vDevice.destroyBuffer(subMeshBuffer);
+
+	imGuiLayer.cleanup();
+	vContext.cleanup();
+	vDevice.cleanup();
+	glfwDestroyWindow(window);
+	glfwTerminate();
+}
+```
+
+src/RTPipeline.h:
+```
+#pragma once
+#include "VulkanDevice.h"
+#include "Types.h"
+#include <vector>
+#include <string>
+
+class RTPipeline
+{
+public:
+	void init(VulkanDevice *device, VkDescriptorSetLayout descriptorSetLayout);
+	void cleanup();
+
+	void bind(VkCommandBuffer commandBuffer);
+	void bindDescriptorSets(VkCommandBuffer commandBuffer, VkDescriptorSet *descriptorSet);
+	void pushConstants(VkCommandBuffer commandBuffer, const PushConstants &pc);
+	void traceRays(VkCommandBuffer commandBuffer, uint32_t width, uint32_t height);
+
+private:
+	VulkanDevice *vDevice = nullptr;
+
+	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+	VkPipeline pipeline = VK_NULL_HANDLE;
+
+	AllocatedBuffer raygenShaderBindingTable;
+	AllocatedBuffer missShaderBindingTable;
+	AllocatedBuffer hitShaderBindingTable;
+
+	VkStridedDeviceAddressRegionKHR raygenRegion{};
+	VkStridedDeviceAddressRegionKHR missRegion{};
+	VkStridedDeviceAddressRegionKHR hitRegion{};
+	VkStridedDeviceAddressRegionKHR callRegion{};
+
+	std::vector<char> readFile(const std::string &filename);
+	VkShaderModule createShaderModule(const std::vector<char> &code);
+	void createPipeline(VkDescriptorSetLayout descriptorSetLayout);
+	void createShaderBindingTable();
+	uint32_t alignUp(uint32_t size, uint32_t alignment);
+};
+```
+
+src/RTPipeline.cpp:
+```
+#include "RTPipeline.h"
+#include <fstream>
+#include <stdexcept>
+#include <cstring>
+
+void RTPipeline::init(VulkanDevice *device, VkDescriptorSetLayout descriptorSetLayout)
+{
+	vDevice = device;
+	createPipeline(descriptorSetLayout);
+	createShaderBindingTable();
+}
+
+void RTPipeline::cleanup()
+{
+	vDevice->destroyBuffer(raygenShaderBindingTable);
+	vDevice->destroyBuffer(missShaderBindingTable);
+	vDevice->destroyBuffer(hitShaderBindingTable);
+
+	if (pipeline != VK_NULL_HANDLE)
+	{
+		vkDestroyPipeline(vDevice->device, pipeline, nullptr);
+	}
+	if (pipelineLayout != VK_NULL_HANDLE)
+	{
+		vkDestroyPipelineLayout(vDevice->device, pipelineLayout, nullptr);
+	}
+}
+
+std::vector<char> RTPipeline::readFile(const std::string &filename)
+{
+	std::ifstream file(filename, std::ios::ate | std::ios::binary);
+	if (!file.is_open())
+		throw std::runtime_error("failed to open shader file: " + filename);
+	size_t fileSize = (size_t)file.tellg();
+	std::vector<char> buffer(fileSize);
+	file.seekg(0);
+	file.read(buffer.data(), fileSize);
+	file.close();
+	return buffer;
+}
+
+VkShaderModule RTPipeline::createShaderModule(const std::vector<char> &code)
+{
+	VkShaderModuleCreateInfo createInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+	createInfo.codeSize = code.size();
+	createInfo.pCode = reinterpret_cast<const uint32_t *>(code.data());
+	VkShaderModule shaderModule;
+	if (vkCreateShaderModule(vDevice->device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create shader module!");
+	}
+	return shaderModule;
+}
+
+void RTPipeline::createPipeline(VkDescriptorSetLayout descriptorSetLayout)
+{
+	// 请确保这些 Shader 均已编译成 SPV
+	auto rgenCode = readFile("shaders/raygen.rgen.spv");
+	auto rmissCode = readFile("shaders/miss.rmiss.spv");
+	auto rmissShadowCode = readFile("shaders/shadow.rmiss.spv");
+	auto rchitCode = readFile("shaders/closesthit.rchit.spv");
+
+	VkShaderModule rgenModule = createShaderModule(rgenCode);
+	VkShaderModule rmissModule = createShaderModule(rmissCode);
+	VkShaderModule rmissShadowModule = createShaderModule(rmissShadowCode);
+	VkShaderModule rchitModule = createShaderModule(rchitCode);
+
+	std::vector<VkPipelineShaderStageCreateInfo> shaderStages;
+	VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+	stageInfo.pName = "main";
+
+	// Shader Stages 数组
+	stageInfo.module = rgenModule;
+	stageInfo.stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+	shaderStages.push_back(stageInfo); // Index 0
+
+	stageInfo.module = rmissModule;
+	stageInfo.stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+	shaderStages.push_back(stageInfo); // Index 1
+
+	stageInfo.module = rmissShadowModule;
+	stageInfo.stage = VK_SHADER_STAGE_MISS_BIT_KHR;
+	shaderStages.push_back(stageInfo); // Index 2
+
+	stageInfo.module = rchitModule;
+	stageInfo.stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+	shaderStages.push_back(stageInfo); // Index 3
+
+	std::vector<VkRayTracingShaderGroupCreateInfoKHR> shaderGroups;
+	VkRayTracingShaderGroupCreateInfoKHR groupInfo{VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR};
+	groupInfo.anyHitShader = VK_SHADER_UNUSED_KHR;
+	groupInfo.closestHitShader = VK_SHADER_UNUSED_KHR;
+	groupInfo.generalShader = VK_SHADER_UNUSED_KHR;
+	groupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
+
+	// --- Shader Groups 注册 ---
+
+	// Raygen (Index 0)
+	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+	groupInfo.generalShader = 0; // Stage Index 0
+	shaderGroups.push_back(groupInfo);
+
+	// Main Miss (Index 1)
+	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+	groupInfo.generalShader = 1; // Stage Index 1
+	shaderGroups.push_back(groupInfo);
+
+	// Shadow Miss (Index 2)
+	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+	groupInfo.generalShader = 2; // Stage Index 2
+	shaderGroups.push_back(groupInfo);
+
+	// Closest Hit (Index 3)
+	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+	groupInfo.generalShader = VK_SHADER_UNUSED_KHR;
+	groupInfo.closestHitShader = 3; // Stage Index 3
+	shaderGroups.push_back(groupInfo);
+
+	VkPushConstantRange pushConstantRange{};
+	pushConstantRange.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
+	pushConstantRange.offset = 0;
+	pushConstantRange.size = sizeof(PushConstants);
+
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+	pipelineLayoutInfo.setLayoutCount = 1;
+	pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+	pipelineLayoutInfo.pushConstantRangeCount = 1;
+	pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+
+	if (vkCreatePipelineLayout(vDevice->device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create ray tracing pipeline layout!");
+	}
+
+	VkRayTracingPipelineCreateInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+	pipelineInfo.stageCount = static_cast<uint32_t>(shaderStages.size());
+	pipelineInfo.pStages = shaderStages.data();
+	pipelineInfo.groupCount = static_cast<uint32_t>(shaderGroups.size());
+	pipelineInfo.pGroups = shaderGroups.data();
+	// 玻璃和水至少需要 4-5 次递归深度才能透射出来
+	pipelineInfo.maxPipelineRayRecursionDepth = 5;
+	pipelineInfo.layout = pipelineLayout;
+
+	if (vDevice->vkCreateRayTracingPipelinesKHR(vDevice->device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to create ray tracing pipeline!");
+	}
+
+	vkDestroyShaderModule(vDevice->device, rgenModule, nullptr);
+	vkDestroyShaderModule(vDevice->device, rmissModule, nullptr);
+	vkDestroyShaderModule(vDevice->device, rmissShadowModule, nullptr);
+	vkDestroyShaderModule(vDevice->device, rchitModule, nullptr);
+}
+
+uint32_t RTPipeline::alignUp(uint32_t size, uint32_t alignment)
+{
+	return (size + alignment - 1) & ~(alignment - 1);
+}
+
+void RTPipeline::createShaderBindingTable()
+{
+	uint32_t handleSize = vDevice->rtProperties.shaderGroupHandleSize;
+	uint32_t handleAlignment = vDevice->rtProperties.shaderGroupHandleAlignment;
+	uint32_t baseAlignment = vDevice->rtProperties.shaderGroupBaseAlignment;
+
+	uint32_t handleSizeAligned = alignUp(handleSize, handleAlignment);
+
+	raygenRegion.stride = alignUp(handleSizeAligned, baseAlignment);
+	raygenRegion.size = raygenRegion.stride;
+
+	missRegion.stride = handleSizeAligned;
+	// 分配 2 个 Miss Shader 的空间
+	missRegion.size = alignUp(2 * handleSizeAligned, baseAlignment);
+
+	hitRegion.stride = handleSizeAligned;
+	hitRegion.size = alignUp(1 * handleSizeAligned, baseAlignment);
+
+	uint32_t groupCount = 4;
+	uint32_t dataSize = groupCount * handleSize;
+	std::vector<uint8_t> handles(dataSize);
+	if (vDevice->vkGetRayTracingShaderGroupHandlesKHR(vDevice->device, pipeline, 0, groupCount, dataSize, handles.data()) != VK_SUCCESS)
+	{
+		throw std::runtime_error("failed to get ray tracing shader group handles!");
+	}
+
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+	raygenShaderBindingTable = vDevice->createBuffer(raygenRegion.size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	missShaderBindingTable = vDevice->createBuffer(missRegion.size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+	hitShaderBindingTable = vDevice->createBuffer(hitRegion.size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	void *mapped;
+
+	// 1. Group 0: Raygen
+	vkMapMemory(vDevice->device, raygenShaderBindingTable.memory, 0, raygenRegion.size, 0, &mapped);
+	memcpy(mapped, handles.data() + 0 * handleSize, handleSize);
+	vkUnmapMemory(vDevice->device, raygenShaderBindingTable.memory);
+
+	// 2. Group 1 和 Group 2: 严格对齐拷贝主 Miss 和 Shadow Miss
+	vkMapMemory(vDevice->device, missShaderBindingTable.memory, 0, missRegion.size, 0, &mapped);
+	uint8_t *missMapped = static_cast<uint8_t *>(mapped);
+	// 主 Miss
+	memcpy(missMapped + 0 * handleSizeAligned, handles.data() + 1 * handleSize, handleSize);
+	// Shadow Miss (紧接着主 Miss)
+	memcpy(missMapped + 1 * handleSizeAligned, handles.data() + 2 * handleSize, handleSize);
+	vkUnmapMemory(vDevice->device, missShaderBindingTable.memory);
+
+	// 3. Group 3: Closest Hit (索引 3)
+	vkMapMemory(vDevice->device, hitShaderBindingTable.memory, 0, hitRegion.size, 0, &mapped);
+	// 拷贝 handles 数组中第 3 个位置的数据
+	memcpy(mapped, handles.data() + 3 * handleSize, handleSize);
+	vkUnmapMemory(vDevice->device, hitShaderBindingTable.memory);
+
+	raygenRegion.deviceAddress = raygenShaderBindingTable.deviceAddress;
+	missRegion.deviceAddress = missShaderBindingTable.deviceAddress;
+	hitRegion.deviceAddress = hitShaderBindingTable.deviceAddress;
+}
+
+void RTPipeline::bind(VkCommandBuffer commandBuffer)
+{
+	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
+}
+
+void RTPipeline::bindDescriptorSets(VkCommandBuffer commandBuffer, VkDescriptorSet *descriptorSet)
+{
+	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayout, 0, 1, descriptorSet, 0, nullptr);
+}
+
+void RTPipeline::pushConstants(VkCommandBuffer commandBuffer, const PushConstants &pc)
+{
+	vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, 0, sizeof(PushConstants), &pc);
+}
+
+void RTPipeline::traceRays(VkCommandBuffer commandBuffer, uint32_t width, uint32_t height)
+{
+	vDevice->vkCmdTraceRaysKHR(commandBuffer, &raygenRegion, &missRegion, &hitRegion, &callRegion, width, height, 1);
+}
+```
+
+src/Camera.h:
+```
+#pragma once
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <GLFW/glfw3.h>
+
+class Camera
+{
+public:
+	void init(glm::vec3 startPosition, float fov = 45.0f);
+
+	// 处理输入并更新摄像机状态，如果状态发生变化（需要重置光追累加），返回 true
+	bool update(GLFWwindow *window, float deltaTime);
+
+	glm::vec3 getPosition() const { return position; }
+	glm::vec3 getForward() const { return forward; }
+	glm::vec3 getUp() const { return up; }
+	glm::vec3 getRight() const { return right; }
+	float getFov() const { return fov; }
+
+private:
+	void updateCameraVectors();
+
+	glm::vec3 position;
+	glm::vec3 forward;
+	glm::vec3 up;
+	glm::vec3 right;
+	glm::vec3 worldUp;
+
+	float yaw;
+	float pitch;
+	float fov;
+
+	float movementSpeed;
+	float mouseSensitivity;
+
+	bool firstMouse;
+	double lastMouseX;
+	double lastMouseY;
+};
+```
+
+src/Camera.cpp:
+```
+#include "Camera.h"
+
+void Camera::init(glm::vec3 startPosition, float startFov)
+{
+	position = startPosition;
+	worldUp = glm::vec3(0.0f, 1.0f, 0.0f);
+	yaw = -90.0f;
+	pitch = 0.0f;
+	fov = startFov;
+
+	movementSpeed = 2.5f;
+	mouseSensitivity = 0.1f;
+
+	firstMouse = true;
+	lastMouseX = 0.0;
+	lastMouseY = 0.0;
+
+	updateCameraVectors();
+}
+
+bool Camera::update(GLFWwindow *window, float deltaTime)
+{
+	bool moved = false;
+
+	// 1. 键盘移动 (WASD + EQ上下)
+	float velocity = movementSpeed * deltaTime;
+	if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+	{
+		position += forward * velocity;
+		moved = true;
+	}
+	if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+	{
+		position -= forward * velocity;
+		moved = true;
+	}
+	if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+	{
+		position -= right * velocity;
+		moved = true;
+	}
+	if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+	{
+		position += right * velocity;
+		moved = true;
+	}
+	if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS)
+	{
+		position += up * velocity;
+		moved = true;
+	}
+	if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS)
+	{
+		position -= up * velocity;
+		moved = true;
+	}
+
+	// 2. 鼠标视角旋转 (按住右键拖动以避免与 ImGui 冲突)
+	if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS)
+	{
+		glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+
+		double xpos, ypos;
+		glfwGetCursorPos(window, &xpos, &ypos);
+
+		if (firstMouse)
+		{
+			lastMouseX = xpos;
+			lastMouseY = ypos;
+			firstMouse = false;
+		}
+
+		double xoffset = xpos - lastMouseX;
+		double yoffset = lastMouseY - ypos;
+		lastMouseX = xpos;
+		lastMouseY = ypos;
+
+		if (xoffset != 0.0 || yoffset != 0.0)
+		{
+			xoffset *= mouseSensitivity;
+			yoffset *= mouseSensitivity;
+
+			yaw += static_cast<float>(xoffset);
+			pitch += static_cast<float>(yoffset);
+
+			if (pitch > 89.0f)
+				pitch = 89.0f;
+			if (pitch < -89.0f)
+				pitch = -89.0f;
+
+			updateCameraVectors();
+			moved = true;
+		}
+	}
+	else
+	{
+		glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+		firstMouse = true;
+	}
+
+	return moved;
+}
+
+void Camera::updateCameraVectors()
+{
+	glm::vec3 front;
+	front.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+	front.y = sin(glm::radians(pitch));
+	front.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+
+	forward = glm::normalize(front);
+	right = glm::normalize(glm::cross(forward, worldUp));
+	up = glm::normalize(glm::cross(right, forward));
+}
+```
+
+src/UIPanel.h:
+```
+#pragma once
+#include <string>
+
+class UIPanel
+{
+public:
+	UIPanel(const std::string &name) : panelName(name) {}
+	virtual ~UIPanel() = default;
+
+	virtual void draw() = 0;
+
+	const std::string &getName() const { return panelName; }
+
+protected:
+	std::string panelName;
+};
+```
+
+src/SettingsPanel.h:
+```
+#pragma once
+#include "UIPanel.h"
+#include "Types.h"
+
+class SettingsPanel : public UIPanel
+{
+public:
+	// 注入配置指针，面板本身不持有状态
+	SettingsPanel(SceneConfig *config);
+	void draw() override;
+
+private:
+	SceneConfig *sceneConfig;
+};
+```
+
+src/SettingsPanel.cpp:
+```
+#include "SettingsPanel.h"
+#include <imgui.h>
+
+SettingsPanel::SettingsPanel(SceneConfig *config)
+    : UIPanel("Scene Settings"), sceneConfig(config) {}
+
+void SettingsPanel::draw()
+{
+	ImGui::Begin(panelName.c_str());
+
+	if (ImGui::CollapsingHeader("Environment & Light", ImGuiTreeNodeFlags_DefaultOpen))
+	{
+		if (ImGui::ColorEdit3("Sky Color", &sceneConfig->envColor.x))
+			sceneConfig->isDirty = true;
+		if (ImGui::SliderFloat("Sky Intensity", &sceneConfig->envIntensity, 0.0f, 10.0f))
+			sceneConfig->isDirty = true;
+
+		ImGui::Separator();
+		if (ImGui::SliderFloat3("Sun Direction", &sceneConfig->lightDirection.x, -1.0f, 1.0f))
+		{
+			if (glm::length(sceneConfig->lightDirection) > 0.001f)
+			{
+				sceneConfig->lightDirection = glm::normalize(sceneConfig->lightDirection);
+				sceneConfig->isDirty = true;
+			}
+		}
+		if (ImGui::ColorEdit3("Sun Color", &sceneConfig->lightColor.x))
+			sceneConfig->isDirty = true;
+		if (ImGui::SliderFloat("Sun Intensity", &sceneConfig->lightIntensity, 0.0f, 50.0f))
+			sceneConfig->isDirty = true;
+
+		float angleDeg = glm::degrees(sceneConfig->lightAngleRadius);
+		if (ImGui::SliderFloat("Sun Size (Deg)", &angleDeg, 0.0f, 10.0f))
+		{
+			sceneConfig->lightAngleRadius = glm::radians(angleDeg);
+			sceneConfig->isDirty = true;
+		}
+	}
+
+	if (ImGui::CollapsingHeader("Global Material Override", ImGuiTreeNodeFlags_DefaultOpen))
+	{
+		if (ImGui::Checkbox("Enable Override", &sceneConfig->overrideMaterial))
+			sceneConfig->isDirty = true;
+
+		ImGui::BeginDisabled(!sceneConfig->overrideMaterial);
+		if (ImGui::ColorEdit3("Albedo / Color", &sceneConfig->albedo.x))
+			sceneConfig->isDirty = true;
+		if (ImGui::SliderFloat("Roughness", &sceneConfig->roughness, 0.0f, 1.0f))
+			sceneConfig->isDirty = true;
+		if (ImGui::SliderFloat("Metallic", &sceneConfig->metallic, 0.0f, 1.0f))
+			sceneConfig->isDirty = true;
+		if (ImGui::SliderFloat("Transmission", &sceneConfig->transmission, 0.0f, 1.0f))
+			sceneConfig->isDirty = true;
+		if (ImGui::SliderFloat("IOR (Index of Refraction)", &sceneConfig->ior, 1.0f, 3.0f))
+			sceneConfig->isDirty = true;
+		ImGui::EndDisabled();
+	}
+
+	ImGui::End();
+}
+```
+
+src/ModelLoader.h:
+```
+#pragma once
+#include "Types.h"
+#include <string>
+#include <vector>
+
+namespace tinygltf
+{
+	class Model;
+	class Node;
+}
+
+class ModelLoader
+{
+public:
+	// 加载 GLTF/GLB 文件并输出展平后的 SceneData
+	bool loadGLTF(const std::string &filepath, SceneData &outScene);
+
+private:
+	void processMaterials(const tinygltf::Model &gltfModel, SceneData &scene);
+	void processNode(const tinygltf::Model &gltfModel, const tinygltf::Node &node, const glm::mat4 &parentTransform, SceneData &scene);
+	void processMesh(const tinygltf::Model &gltfModel, int meshIndex, const glm::mat4 &transform, SceneData &scene);
+};
+```
+
+src/ModelLoader.cpp:
+```
+#define TINYGLTF_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <tiny_gltf.h>
+#include "ModelLoader.h"
+#include <glm/gtc/type_ptr.hpp>
+#include <iostream>
+
+bool ModelLoader::loadGLTF(const std::string &filepath, SceneData &outScene)
+{
+	tinygltf::Model gltfModel;
+	tinygltf::TinyGLTF loader;
+	std::string err, warn;
+
+	bool ret = false;
+	if (filepath.find(".glb") != std::string::npos)
+	{
+		ret = loader.LoadBinaryFromFile(&gltfModel, &err, &warn, filepath);
+	}
+	else
+	{
+		ret = loader.LoadASCIIFromFile(&gltfModel, &err, &warn, filepath);
+	}
+
+	if (!warn.empty())
+		std::cout << "GLTF Warn: " << warn << std::endl;
+	if (!err.empty())
+		std::cerr << "GLTF Error: " << err << std::endl;
+	if (!ret)
+		return false;
+
+	processMaterials(gltfModel, outScene);
+
+	const tinygltf::Scene &defaultScene = gltfModel.scenes[gltfModel.defaultScene > -1 ? gltfModel.defaultScene : 0];
+	for (int nodeIdx : defaultScene.nodes)
+	{
+		processNode(gltfModel, gltfModel.nodes[nodeIdx], glm::mat4(1.0f), outScene);
+	}
+
+	return true;
+}
+
+void ModelLoader::processMaterials(const tinygltf::Model &gltfModel, SceneData &scene)
+{
+	for (const auto &mat : gltfModel.materials)
+	{
+		GPUMaterial gpuMat{};
+		gpuMat.baseColor = glm::vec4(1.0f);
+		gpuMat.metallic = 1.0f;
+		gpuMat.roughness = 1.0f;
+		gpuMat.textureID = -1; // 暂未处理纹理加载
+
+		auto baseColorFactor = mat.pbrMetallicRoughness.baseColorFactor;
+		if (baseColorFactor.size() == 4)
+		{
+			gpuMat.baseColor = glm::make_vec4(baseColorFactor.data());
+		}
+		gpuMat.metallic = static_cast<float>(mat.pbrMetallicRoughness.metallicFactor);
+		gpuMat.roughness = static_cast<float>(mat.pbrMetallicRoughness.roughnessFactor);
+
+		scene.materials.push_back(gpuMat);
+	}
+
+	// 如果模型没有材质，提供一个默认材质
+	if (scene.materials.empty())
+	{
+		scene.materials.push_back({glm::vec4(0.8f), 0.0f, 0.5f, -1, 0});
+	}
+}
+
+void ModelLoader::processNode(const tinygltf::Model &gltfModel, const tinygltf::Node &node, const glm::mat4 &parentTransform, SceneData &scene)
+{
+	glm::mat4 localTransform(1.0f);
+
+	if (node.matrix.size() == 16)
+	{
+		localTransform = glm::make_mat4x4(node.matrix.data());
+	}
+	else
+	{
+		if (node.translation.size() == 3)
+			localTransform = glm::translate(localTransform, glm::vec3(node.translation[0], node.translation[1], node.translation[2]));
+		if (node.rotation.size() == 4)
+		{
+			glm::quat q = glm::make_quat(node.rotation.data());
+			localTransform *= glm::mat4_cast(q);
+		}
+		if (node.scale.size() == 3)
+			localTransform = glm::scale(localTransform, glm::vec3(node.scale[0], node.scale[1], node.scale[2]));
+	}
+
+	glm::mat4 globalTransform = parentTransform * localTransform;
+
+	if (node.mesh > -1)
+	{
+		processMesh(gltfModel, node.mesh, globalTransform, scene);
+	}
+
+	for (int childIdx : node.children)
+	{
+		processNode(gltfModel, gltfModel.nodes[childIdx], globalTransform, scene);
+	}
+}
+
+void ModelLoader::processMesh(const tinygltf::Model &gltfModel, int meshIndex, const glm::mat4 &transform, SceneData &scene)
+{
+	const tinygltf::Mesh &mesh = gltfModel.meshes[meshIndex];
+
+	for (const auto &primitive : mesh.primitives)
+	{
+		if (primitive.mode != 4)
+			continue; // 仅支持三角形 (GL_TRIANGLES)
+
+		SubMesh subMesh{};
+		subMesh.firstIndex = static_cast<uint32_t>(scene.indices.size());
+		subMesh.vertexOffset = static_cast<int32_t>(scene.vertices.size());
+		subMesh.materialIndex = primitive.material > -1 ? primitive.material : 0;
+
+		// 提取顶点位置、法线、UV
+		const float *positionBuffer = nullptr;
+		const float *normalBuffer = nullptr;
+		const float *uvBuffer = nullptr;
+		size_t vertexCount = 0;
+
+		if (primitive.attributes.find("POSITION") != primitive.attributes.end())
+		{
+			const tinygltf::Accessor &accessor = gltfModel.accessors[primitive.attributes.at("POSITION")];
+			const tinygltf::BufferView &view = gltfModel.bufferViews[accessor.bufferView];
+			positionBuffer = reinterpret_cast<const float *>(&(gltfModel.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+			vertexCount = accessor.count;
+		}
+
+		if (primitive.attributes.find("NORMAL") != primitive.attributes.end())
+		{
+			const tinygltf::Accessor &accessor = gltfModel.accessors[primitive.attributes.at("NORMAL")];
+			const tinygltf::BufferView &view = gltfModel.bufferViews[accessor.bufferView];
+			normalBuffer = reinterpret_cast<const float *>(&(gltfModel.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+		}
+
+		if (primitive.attributes.find("TEXCOORD_0") != primitive.attributes.end())
+		{
+			const tinygltf::Accessor &accessor = gltfModel.accessors[primitive.attributes.at("TEXCOORD_0")];
+			const tinygltf::BufferView &view = gltfModel.bufferViews[accessor.bufferView];
+			uvBuffer = reinterpret_cast<const float *>(&(gltfModel.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+		}
+
+		for (size_t i = 0; i < vertexCount; ++i)
+		{
+			Vertex v{};
+			v.pos = glm::make_vec3(&positionBuffer[i * 3]);
+			v.normal = normalBuffer ? glm::normalize(glm::make_vec3(&normalBuffer[i * 3])) : glm::vec3(0.0f, 1.0f, 0.0f);
+			v.uv = uvBuffer ? glm::make_vec2(&uvBuffer[i * 2]) : glm::vec2(0.0f);
+			scene.vertices.push_back(v);
+		}
+
+		// 提取索引
+		if (primitive.indices > -1)
+		{
+			const tinygltf::Accessor &accessor = gltfModel.accessors[primitive.indices];
+			const tinygltf::BufferView &view = gltfModel.bufferViews[accessor.bufferView];
+			const void *dataPtr = &(gltfModel.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]);
+
+			subMesh.indexCount = static_cast<uint32_t>(accessor.count);
+
+			if (accessor.componentType == TINYGLTF_PARAMETER_TYPE_UNSIGNED_INT)
+			{
+				const uint32_t *buf = static_cast<const uint32_t *>(dataPtr);
+				for (size_t i = 0; i < accessor.count; i++)
+					scene.indices.push_back(buf[i]);
+			}
+			else if (accessor.componentType == TINYGLTF_PARAMETER_TYPE_UNSIGNED_SHORT)
+			{
+				const uint16_t *buf = static_cast<const uint16_t *>(dataPtr);
+				for (size_t i = 0; i < accessor.count; i++)
+					scene.indices.push_back(buf[i]);
+			}
+			else if (accessor.componentType == TINYGLTF_PARAMETER_TYPE_UNSIGNED_BYTE)
+			{
+				const uint8_t *buf = static_cast<const uint8_t *>(dataPtr);
+				for (size_t i = 0; i < accessor.count; i++)
+					scene.indices.push_back(buf[i]);
+			}
+		}
+
+		// 注册当前 SubMesh 并在场景中实例化它
+		uint32_t subMeshIdx = static_cast<uint32_t>(scene.subMeshes.size());
+		scene.subMeshes.push_back(subMesh);
+		scene.instances.push_back({transform, subMeshIdx});
+	}
+}
+```
+
+shaders/raygen.rgen:
+```
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba32f) uniform image2D image;
+
+// 工业级极致打包 128 Bytes，安全无泄漏地解包所有全局参数
+layout(push_constant) uniform PushConstants {
+    vec4 camPos_Fov;       // xyz: pos, w: fov (tan(fov/2))
+    vec4 camDir_Aspect;    // xyz: dir, w: aspect
+    vec4 camUp_Frame;      // xyz: up,  w: frameCount
+    vec4 camRight_EnvInt;  // xyz: right, w: envIntensity
+    vec4 envColor_LgAng;   // xyz: envColor, w: lightAngleRadius
+    vec4 lightDir_LgInt;   // xyz: lightDir, w: lightIntensity
+    vec4 albedo_Rough;     // xyz: albedo, w: roughness
+    vec4 matParams;        // x: metallic, y: transmission, z: ior, w: overrideMode
+} pc;
+
+struct RayPayload {
+    vec3 emission;
+    vec3 throughputWeight;
+    uint depth;
+    uint seed;
+    vec3 rayOrigin;
+    vec3 rayDir;
+};
+
+layout(location = 0) rayPayloadEXT RayPayload prd;
+
+uint pcg_hash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rnd(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / 4294967296.0;
+}
+
+void main() {
+    const ivec2 pixelCoords = ivec2(gl_LaunchIDEXT.xy);
+    const ivec2 resolution = ivec2(gl_LaunchSizeEXT.xy);
+    
+    // 提取 FrameCount 用于随机种子
+    uint frameCount = uint(pc.camUp_Frame.w);
+    uint seed = pixelCoords.y * resolution.x + pixelCoords.x + frameCount * 9781;
+
+    vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
+    vec2 inUV = (vec2(pixelCoords) + jitter) / vec2(resolution) * 2.0 - 1.0;
+
+    // 提取投影参数
+    float tanHalfFov = pc.camPos_Fov.w;
+    float aspect = pc.camDir_Aspect.w;
+
+    vec3 origin = pc.camPos_Fov.xyz;
+    vec3 target = pc.camDir_Aspect.xyz + pc.camRight_EnvInt.xyz * inUV.x * tanHalfFov * aspect
+                                   - pc.camUp_Frame.xyz * inUV.y * tanHalfFov;
+    vec3 direction = normalize(target);
+
+    vec3 finalColor = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    prd.depth = 0;
+    prd.seed = seed;
+    prd.rayOrigin = origin;
+    prd.rayDir = direction;
+
+    const uint MAX_BOUNCES = 5;
+    for(uint i = 0; i < MAX_BOUNCES; i++) {
+        prd.emission = vec3(0.0);
+        prd.throughputWeight = vec3(1.0); // 必须重置为单位元
+        
+        // 发射射线
+        traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, prd.rayOrigin, 0.001, prd.rayDir, 10000.0, 0);
+
+        // 如果着色器内部产生了 NaN，防止其进入主路径
+        if (any(isnan(prd.throughputWeight)) || any(isnan(prd.emission))) {
+            break;
+        }
+
+        finalColor += throughput * prd.emission;
+        throughput *= prd.throughputWeight;
+        
+        if(prd.depth == 999 || dot(throughput, throughput) == 0.0) {
+            break;
+        }
+    }
+
+    // 【核心修复】：彻底消除 NaN 污染的残留
+    vec3 accumulatedColor;
+    if (frameCount == 0) {
+        accumulatedColor = finalColor; // 第一帧直接覆盖，跳过混色运算
+    } else {
+        vec3 oldColor = imageLoad(image, pixelCoords).rgb;
+        float weight = 1.0 / (float(frameCount) + 1.0);
+        accumulatedColor = mix(oldColor, finalColor, weight);
+    }
+
+    imageStore(image, pixelCoords, vec4(accumulatedColor, 1.0));
+}
+```
+
+shaders/miss.rmiss:
+```
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+struct RayPayload {
+    vec3 emission;
+    vec3 throughputWeight;
+    uint depth;
+    uint seed;
+    vec3 rayOrigin;
+    vec3 rayDir;
+};
+
+layout(location = 0) rayPayloadInEXT RayPayload prd;
+
+// Miss Shader 也必须同步使用极致打包布局
+layout(push_constant) uniform PushConstants {
+    vec4 camPos_Fov;       
+    vec4 camDir_Aspect;    
+    vec4 camUp_Frame;      
+    vec4 camRight_EnvInt;  // w: envIntensity
+    vec4 envColor_LgAng;   // xyz: envColor
+    vec4 lightDir_LgInt;   
+    vec4 albedo_Rough;     
+    vec4 matParams;        
+} pc;
+
+void main() {
+    vec3 dir = normalize(gl_WorldRayDirectionEXT);
+    float t = 0.5 * (dir.y + 1.0);
+    
+    // 提取天空颜色和亮度
+    vec3 skyBase = mix(vec3(1.0), pc.envColor_LgAng.xyz, t);
+    float skyInt = pc.camRight_EnvInt.w;
+
+    prd.emission = skyBase * skyInt;
+    prd.throughputWeight = vec3(0.0);
+    prd.depth = 999;
+}
+```
+
+shaders/denoise.comp:
+```
+
+```
+
+shaders/shadow.rmiss:
+```
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(location = 1) rayPayloadInEXT bool isShadowed;
+
+void main() {
+    isShadowed = false;
+}
+```
+
+shaders/closesthit.rchit:
+```
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_buffer_reference2 : require
+
+const float PI = 3.14159265359;
+const float EPSILON = 0.0001;
+
+struct Vertex { vec3 pos; vec3 normal; vec2 uv; };
+struct SubMesh { uint firstIndex; uint indexCount; int vertexOffset; uint materialIndex; };
+struct GPUMaterial { vec4 baseColor; float metallic; float roughness; float transmission; float ior; int textureID; int pad[3]; };
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 2, set = 0, scalar) buffer Vertices { Vertex v[]; } vertices;
+layout(binding = 3, set = 0, scalar) buffer Indices { uint i[]; } indices;
+layout(binding = 4, set = 0, scalar) buffer SubMeshes { SubMesh m[]; } subMeshes;
+layout(binding = 5, set = 0, scalar) buffer Materials { GPUMaterial m[]; } materials;
+
+struct RayPayload { vec3 emission; vec3 throughputWeight; uint depth; uint seed; vec3 rayOrigin; vec3 rayDir; };
+layout(location = 0) rayPayloadInEXT RayPayload prd;
+layout(location = 1) rayPayloadEXT bool isShadowed;
+
+hitAttributeEXT vec2 attribs;
+
+layout(push_constant) uniform PushConstants {
+    vec4 camPos_Fov;       
+    vec4 camDir_Aspect;    
+    vec4 camUp_Frame;      
+    vec4 camRight_EnvInt;  
+    vec4 envColor_LgAng;   
+    vec4 lightDir_LgInt;   
+    vec4 albedo_Rough;     
+    vec4 matParams;        
+} pc;
+
+uint pcg_hash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rnd(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / 4294967296.0;
+}
+
+mat3 buildTBN(vec3 n) {
+    vec3 up = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, n));
+    vec3 b = cross(n, t);
+    return mat3(t, b, n);
+}
+
+vec3 cosineSampleHemisphere(vec3 n, inout uint seed) {
+    float r1 = rnd(seed);
+    float r2 = rnd(seed);
+    float z = sqrt(1.0 - r2);
+    float phi = 2.0 * PI * r1;
+    return buildTBN(n) * vec3(cos(phi) * sqrt(r2), sin(phi) * sqrt(r2), z);
+}
+
+vec3 importanceSampleGGX(vec2 xi, vec3 n, float roughness) {
+    float a = roughness * roughness;
+    float phi = 2.0 * PI * xi.x;
+    float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    return buildTBN(n) * vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+}
+
+// 物理精确的电介质菲涅尔方程 (用于玻璃和水，替代无法处理全反射的 Schlick 近似)
+float fresnelDielectric(float cosThetaI, float etaI, float etaT) {
+    cosThetaI = clamp(cosThetaI, -1.0, 1.0);
+    if (cosThetaI < 0.0) {
+        float temp = etaI; etaI = etaT; etaT = temp;
+        cosThetaI = -cosThetaI;
+    }
+    float sinThetaI = sqrt(max(0.0, 1.0 - cosThetaI * cosThetaI));
+    float sinThetaT = etaI / etaT * sinThetaI;
+    if (sinThetaT >= 1.0) return 1.0; // TIR (全反射)
+    float cosThetaT = sqrt(max(0.0, 1.0 - sinThetaT * sinThetaT));
+    float Rparl = ((etaT * cosThetaI) - (etaI * cosThetaT)) / ((etaT * cosThetaI) + (etaI * cosThetaT));
+    float Rperp = ((etaI * cosThetaI) - (etaT * cosThetaT)) / ((etaI * cosThetaI) + (etaT * cosThetaT));
+    return (Rparl * Rparl + Rperp * Rperp) / 2.0;
+}
+
+vec3 offsetRay(const vec3 p, const vec3 n) {
+    const float intScale = 256.0f; const float floatScale = 1.0f / 65536.0f; const float origin = 1.0f / 32.0f;
+    ivec3 of_i = ivec3(intScale * n.x, intScale * n.y, intScale * n.z);
+    vec3 p_i = vec3(intBitsToFloat(floatBitsToInt(p.x) + ((p.x < 0.0f) ? -of_i.x : of_i.x)),
+                    intBitsToFloat(floatBitsToInt(p.y) + ((p.y < 0.0f) ? -of_i.y : of_i.y)),
+                    intBitsToFloat(floatBitsToInt(p.z) + ((p.z < 0.0f) ? -of_i.z : of_i.z)));
+    return vec3(abs(p.x) < origin ? p.x + floatScale * n.x : p_i.x,
+                abs(p.y) < origin ? p.y + floatScale * n.y : p_i.y,
+                abs(p.z) < origin ? p.z + floatScale * n.z : p_i.z);
+}
+
+void main() {
+    uint subMeshIdx = gl_InstanceCustomIndexEXT;
+    SubMesh subMesh = subMeshes.m[subMeshIdx];
+    ivec3 index = ivec3(indices.i[subMesh.firstIndex + 3 * gl_PrimitiveID], indices.i[subMesh.firstIndex + 3 * gl_PrimitiveID + 1], indices.i[subMesh.firstIndex + 3 * gl_PrimitiveID + 2]);
+
+    Vertex v0 = vertices.v[index.x + subMesh.vertexOffset];
+    Vertex v1 = vertices.v[index.y + subMesh.vertexOffset];
+    Vertex v2 = vertices.v[index.z + subMesh.vertexOffset];
+
+    const vec3 barycentrics = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    vec3 worldPos0 = vec3(gl_ObjectToWorldEXT * vec4(v0.pos, 1.0));
+    vec3 worldPos1 = vec3(gl_ObjectToWorldEXT * vec4(v1.pos, 1.0));
+    vec3 worldPos2 = vec3(gl_ObjectToWorldEXT * vec4(v2.pos, 1.0));
+    vec3 worldPos = worldPos0 * barycentrics.x + worldPos1 * barycentrics.y + worldPos2 * barycentrics.z;
+
+    vec3 edge1 = worldPos1 - worldPos0;
+    vec3 edge2 = worldPos2 - worldPos0;
+    vec3 crossProd = cross(edge1, edge2);
+    
+    // 如果是退化三角形，立刻终止该射线的计算，防止抛出 NaN
+    if (dot(crossProd, crossProd) < 1e-6) {
+        prd.depth = 999;
+        return;
+    }
+    vec3 geomNormal = normalize(crossProd);
+
+    vec3 sNormal = vec3(gl_ObjectToWorldEXT * vec4(v0.normal * barycentrics.x + v1.normal * barycentrics.y + v2.normal * barycentrics.z, 0.0));
+    // 防止法线数据错误导致 NaN
+    vec3 shadingNormal = dot(sNormal, sNormal) < 1e-6 ? geomNormal : normalize(sNormal);
+
+    // 1. 判断内外界面
+    vec3 V = normalize(-gl_WorldRayDirectionEXT);
+    bool isInside = dot(geomNormal, V) < 0.0;
+    
+    vec3 N = isInside ? -shadingNormal : shadingNormal;
+    vec3 physN = isInside ? -geomNormal : geomNormal;
+
+    // 2. 材质解析
+    vec3 albedo = materials.m[subMesh.materialIndex].baseColor.xyz;
+    float roughness = materials.m[subMesh.materialIndex].roughness;
+    float metallic = materials.m[subMesh.materialIndex].metallic;
+    float transmission = materials.m[subMesh.materialIndex].transmission;
+    float ior = materials.m[subMesh.materialIndex].ior;
+
+    if (pc.matParams.w > 0.5f) { // Override Flag
+        albedo = pc.albedo_Rough.xyz;
+        roughness = pc.albedo_Rough.w;
+        metallic = pc.matParams.x;
+        transmission = pc.matParams.y;
+        ior = pc.matParams.z;
+    }
+    
+    roughness = clamp(roughness, 0.01, 1.0);
+    metallic = clamp(metallic, 0.0, 1.0);
+    transmission = clamp(transmission, 0.0, 1.0);
+
+    // 计算相对折射率
+    float etaI = isInside ? ior : 1.0;
+    float etaT = isInside ? 1.0 : ior;
+    float eta = etaI / etaT;
+
+    float F = fresnelDielectric(dot(V, N), etaI, etaT);
+    
+    // 金属没有透射
+    transmission *= (1.0 - metallic); 
+
+    // 3. 概率分配 (俄罗斯轮盘赌)
+    float pSpecular = F;
+    float pTransmit = (1.0 - F) * transmission;
+    float pDiffuse  = (1.0 - F) * (1.0 - transmission);
+    
+    float pTotal = pSpecular + pTransmit + pDiffuse;
+    if (pTotal < 1e-4) {
+        prd.depth = 999; 
+        return;
+    }
+    pSpecular /= pTotal; pTransmit /= pTotal; pDiffuse /= pTotal;
+
+    prd.emission = vec3(0.0);
+    vec3 nextDir;
+    vec3 brdfWeight = vec3(0.0);
+    vec3 rayOriginOffset = physN;
+
+    float randVal = rnd(prd.seed);
+
+    // 4. 路径选择 (增加 p > 0.001 阈值，拦截由于精度溢出导致的除 0)
+    if (randVal < pSpecular && pSpecular > 0.001) {
+        // --- 镜面反射 ---
+        vec3 H = importanceSampleGGX(vec2(rnd(prd.seed), rnd(prd.seed)), N, roughness);
+        nextDir = reflect(-V, H);
+        if (dot(nextDir, physN) <= 0.0) { prd.depth = 999; return; } 
+        brdfWeight = mix(vec3(1.0), albedo, metallic) / pSpecular; 
+    } 
+    else if (randVal < pSpecular + pTransmit && pTransmit > 0.001) {
+        // --- 透射 (玻璃) ---
+        vec3 H = importanceSampleGGX(vec2(rnd(prd.seed), rnd(prd.seed)), N, roughness);
+        vec3 refracted = refract(-V, H, eta);
+        
+        if (dot(refracted, refracted) == 0.0) {
+            nextDir = reflect(-V, H);
+            rayOriginOffset = physN; 
+        } else {
+            nextDir = normalize(refracted);
+            rayOriginOffset = -physN; 
+        }
+        
+        brdfWeight = albedo / pTransmit; 
+    } 
+    else if (pDiffuse > 0.001) {
+        // --- 漫反射 ---
+        nextDir = cosineSampleHemisphere(N, prd.seed);
+        if (dot(nextDir, physN) <= 0.0) { prd.depth = 999; return; }
+        brdfWeight = albedo / pDiffuse;
+    } else {
+        // 应对极端边界状态
+        prd.depth = 999;
+        return;
+    }
+
+    // 5. 比尔-朗伯定律衰减 (Volume Absorption)
+    if (isInside) {
+        // 使用 albedo 推导吸收系数。颜色越暗，吸收越强。
+        vec3 absorption = (1.0 - albedo) * 2.0; 
+        prd.throughputWeight *= exp(-absorption * gl_HitTEXT);
+    }
+
+    prd.throughputWeight *= brdfWeight;
+    prd.rayOrigin = offsetRay(worldPos, rayOriginOffset);
+    prd.rayDir = nextDir;
+    prd.depth += 1;
+}
+```
+

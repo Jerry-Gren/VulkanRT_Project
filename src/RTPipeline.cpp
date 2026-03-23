@@ -54,6 +54,7 @@ VkShaderModule RTPipeline::createShaderModule(const std::vector<char> &code)
 
 void RTPipeline::createPipeline(VkDescriptorSetLayout descriptorSetLayout)
 {
+	// 请确保这些 Shader 均已编译成 SPV
 	auto rgenCode = readFile("shaders/raygen.rgen.spv");
 	auto rmissCode = readFile("shaders/miss.rmiss.spv");
 	auto rmissShadowCode = readFile("shaders/shadow.rmiss.spv");
@@ -68,21 +69,22 @@ void RTPipeline::createPipeline(VkDescriptorSetLayout descriptorSetLayout)
 	VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
 	stageInfo.pName = "main";
 
+	// Shader Stages 数组
 	stageInfo.module = rgenModule;
 	stageInfo.stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-	shaderStages.push_back(stageInfo);
+	shaderStages.push_back(stageInfo); // Index 0
 
 	stageInfo.module = rmissModule;
 	stageInfo.stage = VK_SHADER_STAGE_MISS_BIT_KHR;
-	shaderStages.push_back(stageInfo);
+	shaderStages.push_back(stageInfo); // Index 1
 
 	stageInfo.module = rmissShadowModule;
 	stageInfo.stage = VK_SHADER_STAGE_MISS_BIT_KHR;
-	shaderStages.push_back(stageInfo);
+	shaderStages.push_back(stageInfo); // Index 2
 
 	stageInfo.module = rchitModule;
 	stageInfo.stage = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-	shaderStages.push_back(stageInfo);
+	shaderStages.push_back(stageInfo); // Index 3
 
 	std::vector<VkRayTracingShaderGroupCreateInfoKHR> shaderGroups;
 	VkRayTracingShaderGroupCreateInfoKHR groupInfo{VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR};
@@ -91,21 +93,27 @@ void RTPipeline::createPipeline(VkDescriptorSetLayout descriptorSetLayout)
 	groupInfo.generalShader = VK_SHADER_UNUSED_KHR;
 	groupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
 
+	// --- Shader Groups 注册 ---
+
+	// Raygen (Index 0)
 	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-	groupInfo.generalShader = 0;
+	groupInfo.generalShader = 0; // Stage Index 0
 	shaderGroups.push_back(groupInfo);
 
+	// Main Miss (Index 1)
 	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-	groupInfo.generalShader = 1;
+	groupInfo.generalShader = 1; // Stage Index 1
 	shaderGroups.push_back(groupInfo);
 
+	// Shadow Miss (Index 2)
 	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-	groupInfo.generalShader = 2;
+	groupInfo.generalShader = 2; // Stage Index 2
 	shaderGroups.push_back(groupInfo);
 
+	// Closest Hit (Index 3)
 	groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
 	groupInfo.generalShader = VK_SHADER_UNUSED_KHR;
-	groupInfo.closestHitShader = 3;
+	groupInfo.closestHitShader = 3; // Stage Index 3
 	shaderGroups.push_back(groupInfo);
 
 	VkPushConstantRange pushConstantRange{};
@@ -129,7 +137,8 @@ void RTPipeline::createPipeline(VkDescriptorSetLayout descriptorSetLayout)
 	pipelineInfo.pStages = shaderStages.data();
 	pipelineInfo.groupCount = static_cast<uint32_t>(shaderGroups.size());
 	pipelineInfo.pGroups = shaderGroups.data();
-	pipelineInfo.maxPipelineRayRecursionDepth = 2;
+	// 玻璃和水至少需要 4-5 次递归深度才能透射出来
+	pipelineInfo.maxPipelineRayRecursionDepth = 5;
 	pipelineInfo.layout = pipelineLayout;
 
 	if (vDevice->vkCreateRayTracingPipelinesKHR(vDevice->device, VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline) != VK_SUCCESS)
@@ -166,7 +175,7 @@ void RTPipeline::createShaderBindingTable()
 	hitRegion.stride = handleSizeAligned;
 	hitRegion.size = alignUp(1 * handleSizeAligned, baseAlignment);
 
-	uint32_t groupCount = 4; // Raygen(1) + Miss(2) + Hit(1) = 4
+	uint32_t groupCount = 4;
 	uint32_t dataSize = groupCount * handleSize;
 	std::vector<uint8_t> handles(dataSize);
 	if (vDevice->vkGetRayTracingShaderGroupHandlesKHR(vDevice->device, pipeline, 0, groupCount, dataSize, handles.data()) != VK_SUCCESS)
@@ -179,24 +188,26 @@ void RTPipeline::createShaderBindingTable()
 	missShaderBindingTable = vDevice->createBuffer(missRegion.size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 	hitShaderBindingTable = vDevice->createBuffer(hitRegion.size, usage, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-	// 修复拷贝逻辑：严格按照句柄索引和对齐要求写入
 	void *mapped;
 
-	// 1. 写入 Group 0: Raygen
+	// 1. Group 0: Raygen
 	vkMapMemory(vDevice->device, raygenShaderBindingTable.memory, 0, raygenRegion.size, 0, &mapped);
 	memcpy(mapped, handles.data() + 0 * handleSize, handleSize);
 	vkUnmapMemory(vDevice->device, raygenShaderBindingTable.memory);
 
-	// 2. 写入 Group 1 和 Group 2: 主 Miss 和 Shadow Miss
+	// 2. Group 1 和 Group 2: 严格对齐拷贝主 Miss 和 Shadow Miss
 	vkMapMemory(vDevice->device, missShaderBindingTable.memory, 0, missRegion.size, 0, &mapped);
 	uint8_t *missMapped = static_cast<uint8_t *>(mapped);
-	memcpy(missMapped + 0 * handleSizeAligned, handles.data() + 1 * handleSize, handleSize); // 主 Miss (Index 1)
-	memcpy(missMapped + 1 * handleSizeAligned, handles.data() + 2 * handleSize, handleSize); // Shadow Miss (Index 2)
+	// 主 Miss
+	memcpy(missMapped + 0 * handleSizeAligned, handles.data() + 1 * handleSize, handleSize);
+	// Shadow Miss (紧接着主 Miss)
+	memcpy(missMapped + 1 * handleSizeAligned, handles.data() + 2 * handleSize, handleSize);
 	vkUnmapMemory(vDevice->device, missShaderBindingTable.memory);
 
-	// 3. 写入 Group 3: Closest Hit
+	// 3. Group 3: Closest Hit (索引 3)
 	vkMapMemory(vDevice->device, hitShaderBindingTable.memory, 0, hitRegion.size, 0, &mapped);
-	memcpy(mapped, handles.data() + 3 * handleSize, handleSize); // 必须是 3 * handleSize！
+	// 拷贝 handles 数组中第 3 个位置的数据
+	memcpy(mapped, handles.data() + 3 * handleSize, handleSize);
 	vkUnmapMemory(vDevice->device, hitShaderBindingTable.memory);
 
 	raygenRegion.deviceAddress = raygenShaderBindingTable.deviceAddress;

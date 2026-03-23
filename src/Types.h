@@ -30,15 +30,21 @@ struct Vertex
 // 用于 UI 和主循环共享的状态配置，隔离 UI 渲染与底层逻辑
 struct SceneConfig
 {
-	// 现有环境光（作为 Miss Shader 的天空）
 	glm::vec3 envColor = {0.5f, 0.7f, 1.0f};
 	float envIntensity = 1.0f;
 
-	// 【新增】：显式面光源/太阳光 (NEE)
 	glm::vec3 lightDirection = glm::normalize(glm::vec3(0.5f, 1.0f, -0.5f));
 	glm::vec3 lightColor = {1.0f, 0.95f, 0.9f};
 	float lightIntensity = 5.0f;
-	float lightAngleRadius = glm::radians(2.0f); // 太阳看起来的大小，控制阴影柔和度
+	float lightAngleRadius = glm::radians(2.0f);
+
+	// 全局材质调试覆盖参数
+	bool overrideMaterial = false;
+	glm::vec3 albedo = {1.0f, 1.0f, 1.0f};
+	float roughness = 0.05f;
+	float metallic = 0.0f;
+	float transmission = 1.0f;
+	float ior = 1.5f;
 
 	bool isDirty = true;
 };
@@ -47,16 +53,14 @@ struct SceneConfig
 // 严格控制在 128 字节内 (Vulkan 最低保证标准)
 struct PushConstants
 {
-	glm::vec4 cameraPos;
-	glm::vec4 cameraDir;
-	glm::vec4 cameraUp;
-	glm::vec4 cameraRight;
-	glm::vec4 projParams;
-	glm::vec4 envConfig; // xyz: envColor * envIntensity, w: frameCount
-
-	// 【新增】：光源配置数据
-	glm::vec4 lightDir;   // xyz: direction, w: angleRadius
-	glm::vec4 lightColor; // xyz: color * intensity, w: padding
+	glm::vec4 camPos_Fov;	   // xyz: pos, w: fov (tan(fov/2))
+	glm::vec4 camDir_Aspect;   // xyz: dir, w: aspect
+	glm::vec4 camUp_Frame;	   // xyz: up,  w: frameCount
+	glm::vec4 camRight_EnvInt; // xyz: right, w: envIntensity
+	glm::vec4 envColor_LgAng;  // xyz: envColor, w: lightAngle
+	glm::vec4 lightDir_LgInt;  // xyz: lightDir, w: lightIntensity
+	glm::vec4 albedo_Rough;	   // xyz: albedo, w: roughness
+	glm::vec4 matParams;	   // x: metallic, y: transmission, z: ior, w: overrideMode
 };
 
 struct GPUMaterial
@@ -64,8 +68,10 @@ struct GPUMaterial
 	glm::vec4 baseColor;
 	float metallic;
 	float roughness;
-	int textureID; // -1 表示无纹理
-	int padding;   // 满足 std140/std430 对齐要求
+	float transmission; // 0.0: 不透明, 1.0: 全透明玻璃
+	float ior;	    // 折射率 (如玻璃 1.5, 水 1.33)
+	int textureID;
+	int padding[3]; // 保持 16 字节对齐
 };
 
 struct SubMesh

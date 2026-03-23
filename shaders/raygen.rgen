@@ -4,20 +4,21 @@
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 1, set = 0, rgba32f) uniform image2D image;
 
+// 工业级极致打包 128 Bytes，安全无泄漏地解包所有全局参数
 layout(push_constant) uniform PushConstants {
-    vec4 cameraPos;
-    vec4 cameraDir;
-    vec4 cameraUp;
-    vec4 cameraRight;
-    vec4 projParams;
-    vec4 envConfig;   // xyz: envColor * envIntensity, w: frameCount
-    vec4 matParams1;  // xyz: albedo, w: roughness
-    vec4 matParams2;  // x: metallic, yzw: padding
+    vec4 camPos_Fov;       // xyz: pos, w: fov (tan(fov/2))
+    vec4 camDir_Aspect;    // xyz: dir, w: aspect
+    vec4 camUp_Frame;      // xyz: up,  w: frameCount
+    vec4 camRight_EnvInt;  // xyz: right, w: envIntensity
+    vec4 envColor_LgAng;   // xyz: envColor, w: lightAngleRadius
+    vec4 lightDir_LgInt;   // xyz: lightDir, w: lightIntensity
+    vec4 albedo_Rough;     // xyz: albedo, w: roughness
+    vec4 matParams;        // x: metallic, y: transmission, z: ior, w: overrideMode
 } pc;
 
 struct RayPayload {
     vec3 emission;
-    vec3 albedo;
+    vec3 throughputWeight;
     uint depth;
     uint seed;
     vec3 rayOrigin;
@@ -26,7 +27,6 @@ struct RayPayload {
 
 layout(location = 0) rayPayloadEXT RayPayload prd;
 
-// PCG 随机数生成器
 uint pcg_hash(uint seed) {
     uint state = seed * 747796405u + 2891336453u;
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
@@ -42,16 +42,20 @@ void main() {
     const ivec2 pixelCoords = ivec2(gl_LaunchIDEXT.xy);
     const ivec2 resolution = ivec2(gl_LaunchSizeEXT.xy);
     
-    // 初始化随机种子
-    uint seed = pixelCoords.y * resolution.x + pixelCoords.x + uint(pc.envConfig.w) * 9781;
+    // 提取 FrameCount 用于随机种子
+    uint frameCount = uint(pc.camUp_Frame.w);
+    uint seed = pixelCoords.y * resolution.x + pixelCoords.x + frameCount * 9781;
 
-    // 像素内抗锯齿抖动 (Jitter)
     vec2 jitter = vec2(rnd(seed), rnd(seed)) - 0.5;
     vec2 inUV = (vec2(pixelCoords) + jitter) / vec2(resolution) * 2.0 - 1.0;
 
-    vec3 origin = pc.cameraPos.xyz;
-    vec3 target = pc.cameraDir.xyz + pc.cameraRight.xyz * inUV.x * pc.projParams.x * pc.projParams.y 
-                                   - pc.cameraUp.xyz * inUV.y * pc.projParams.x;
+    // 提取投影参数
+    float tanHalfFov = pc.camPos_Fov.w;
+    float aspect = pc.camDir_Aspect.w;
+
+    vec3 origin = pc.camPos_Fov.xyz;
+    vec3 target = pc.camDir_Aspect.xyz + pc.camRight_EnvInt.xyz * inUV.x * tanHalfFov * aspect
+                                   - pc.camUp_Frame.xyz * inUV.y * tanHalfFov;
     vec3 direction = normalize(target);
 
     vec3 finalColor = vec3(0.0);
@@ -62,26 +66,36 @@ void main() {
     prd.rayOrigin = origin;
     prd.rayDir = direction;
 
-    // 路径追踪主循环
-    const uint MAX_BOUNCES = 5;
+    const uint MAX_BOUNCES = 50;
     for(uint i = 0; i < MAX_BOUNCES; i++) {
         prd.emission = vec3(0.0);
-        prd.albedo = vec3(0.0);
+        prd.throughputWeight = vec3(1.0); // 必须重置为单位元
         
+        // 发射射线
         traceRayEXT(topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, prd.rayOrigin, 0.001, prd.rayDir, 10000.0, 0);
 
+        // 如果着色器内部产生了 NaN，防止其进入主路径
+        if (any(isnan(prd.throughputWeight)) || any(isnan(prd.emission))) {
+            break;
+        }
+
         finalColor += throughput * prd.emission;
-        throughput *= prd.albedo;
+        throughput *= prd.throughputWeight;
         
         if(prd.depth == 999 || dot(throughput, throughput) == 0.0) {
             break;
         }
     }
 
-    // 时间累加 (Progressive Accumulation)
-    vec3 oldColor = imageLoad(image, pixelCoords).rgb;
-    float weight = 1.0 / (pc.envConfig.w + 1.0);
-    vec3 accumulatedColor = mix(oldColor, finalColor, weight);
+    // 【核心修复】：彻底消除 NaN 污染的残留
+    vec3 accumulatedColor;
+    if (frameCount == 0) {
+        accumulatedColor = finalColor; // 第一帧直接覆盖，跳过混色运算
+    } else {
+        vec3 oldColor = imageLoad(image, pixelCoords).rgb;
+        float weight = 1.0 / (float(frameCount) + 1.0);
+        accumulatedColor = mix(oldColor, finalColor, weight);
+    }
 
     imageStore(image, pixelCoords, vec4(accumulatedColor, 1.0));
 }

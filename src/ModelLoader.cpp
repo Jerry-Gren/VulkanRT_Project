@@ -48,6 +48,8 @@ void ModelLoader::processMaterials(const tinygltf::Model &gltfModel, SceneData &
 		gpuMat.baseColor = glm::vec4(1.0f);
 		gpuMat.metallic = 1.0f;
 		gpuMat.roughness = 1.0f;
+		gpuMat.transmission = 0.0f;
+		gpuMat.ior = 1.5f;
 		gpuMat.textureID = -1; // 暂未处理纹理加载
 
 		auto baseColorFactor = mat.pbrMetallicRoughness.baseColorFactor;
@@ -64,7 +66,8 @@ void ModelLoader::processMaterials(const tinygltf::Model &gltfModel, SceneData &
 	// 如果模型没有材质，提供一个默认材质
 	if (scene.materials.empty())
 	{
-		scene.materials.push_back({glm::vec4(0.8f), 0.0f, 0.5f, -1, 0});
+		// vec4 baseColor, metallic, roughness, transmission, ior, textureID, padding
+		scene.materials.push_back({glm::vec4(0.8f), 0.0f, 0.5f, 0.0f, 1.5f, -1, {0, 0, 0}});
 	}
 }
 
