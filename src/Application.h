@@ -2,7 +2,6 @@
 
 #include <GLFW/glfw3.h>
 #include <vector>
-#include <stdexcept>
 #include <memory>
 
 #include "VulkanDevice.h"
@@ -16,7 +15,7 @@
 #include "Types.h"
 #include "Camera.h"
 #include "SettingsPanel.h"
-#include "ModelLoader.h"
+#include "RenderScene.h"
 
 class Application
 {
@@ -34,16 +33,8 @@ private:
 	ImageManager imageManager;
 	DescriptorManager descriptorManager;
 	RTPipeline rtPipeline;
-	ModelLoader modelLoader;
 
-	// 场景数据容器
-	SceneData sceneData;
-
-	// 几何与材质资源
-	AllocatedBuffer vertexBuffer;
-	AllocatedBuffer indexBuffer;
-	AllocatedBuffer materialBuffer;
-	AllocatedBuffer subMeshBuffer;
+	RenderScene renderScene;
 
 	AllocatedImage storageImage;
 	VkDescriptorSetLayout rtDescriptorSetLayout = VK_NULL_HANDLE;
@@ -64,7 +55,6 @@ private:
 
 	void initWindow();
 	void initVulkan();
-	void loadScene();
 	void createStorageImage();
 	void createDescriptors();
 	void updateDescriptors();

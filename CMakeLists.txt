@@ -48,16 +48,21 @@ set(SPIRV_SHADERS "")
 
 foreach(SHADER ${SHADERS})
     get_filename_component(FILE_NAME ${SHADER} NAME)
-    # 将输出定向到构建目录的 shaders 文件夹中
     set(SPIRV_FILE "${CMAKE_CURRENT_BINARY_DIR}/shaders/${FILE_NAME}.spv")
     list(APPEND SPIRV_SHADERS ${SPIRV_FILE})
     
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
-        # 强制指定 target-env 为 vulkan1.2 以支持光追扩展特性
-        COMMAND ${GLSLC} --target-env=vulkan1.2 ${SHADER} -o ${SPIRV_FILE}
+        # 新增 -I "${SHADER_DIR}" 以支持 GL_GOOGLE_include_directive
+        COMMAND ${GLSLC} --target-env=vulkan1.2 -I "${SHADER_DIR}" ${SHADER} -o ${SPIRV_FILE}
         DEPENDS ${SHADER}
+        # 显式声明依赖，如果头文件更新，触发重新编译
+        DEPENDS "${SHADER_DIR}/common.glsl"
+        DEPENDS "${SHADER_DIR}/random.glsl"
+        DEPENDS "${SHADER_DIR}/math.glsl"
+        DEPENDS "${SHADER_DIR}/sampling.glsl"
+        DEPENDS "${SHADER_DIR}/bsdf.glsl"
     )
 endforeach()
 

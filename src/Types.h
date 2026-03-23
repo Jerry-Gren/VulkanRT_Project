@@ -1,6 +1,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
 #include <glm/glm.hpp>
+#include <vector>
 
 // 1. 显存资源分配封装
 struct AllocatedBuffer
@@ -41,9 +42,9 @@ struct SceneConfig
 	// 全局材质调试覆盖参数
 	bool overrideMaterial = false;
 	glm::vec3 albedo = {1.0f, 1.0f, 1.0f};
-	float roughness = 0.05f;
+	float roughness = 0.5f;
 	float metallic = 0.0f;
-	float transmission = 1.0f;
+	float transmission = 0.0f;
 	float ior = 1.5f;
 
 	bool isDirty = true;
@@ -74,6 +75,14 @@ struct GPUMaterial
 	int padding[3]; // 保持 16 字节对齐
 };
 
+struct GPULight
+{
+	glm::vec4 position; // xyz: 坐标/方向, w: 类型 (0=方向光, 1=点光源, 2=面光源)
+	glm::vec4 emission; // xyz: 辐射强度, w: 衰减半径/面积
+	glm::vec4 u;	    // 面光源的切向量 / 额外参数
+	glm::vec4 v;	    // 面光源的副切向量 / 额外参数
+};
+
 struct SubMesh
 {
 	uint32_t firstIndex;
@@ -94,6 +103,7 @@ struct SceneData
 	std::vector<Vertex> vertices;
 	std::vector<uint32_t> indices;
 	std::vector<GPUMaterial> materials;
+	std::vector<GPULight> lights;
 	std::vector<SubMesh> subMeshes;
 	std::vector<InstanceData> instances;
 };

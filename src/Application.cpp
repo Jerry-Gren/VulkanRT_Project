@@ -40,40 +40,15 @@ void Application::initVulkan()
 
 	uiPanels.push_back(std::make_unique<SettingsPanel>(&sceneConfig));
 
-	loadScene();
+	// 移交场景构建权
+	renderScene.init(&vDevice, &bufferManager, &asBuilder);
+	renderScene.loadScene("models/test.glb");
+
 	createStorageImage();
 	createDescriptors();
 
 	rtPipeline.init(&vDevice, rtDescriptorSetLayout);
 	camera.init(glm::vec3(0.0f, 1.0f, -3.0f));
-}
-
-void Application::loadScene()
-{
-	// 尝试加载外部模型，如果失败则回退到硬编码三角形防止崩溃
-	// 请确保可执行文件同级目录下有 models/test.glb 文件
-	if (!modelLoader.loadGLTF("models/test.glb", sceneData))
-	{
-		std::cout << "Warning: Could not load models/test.glb, generating default triangle.\n";
-
-		sceneData.vertices = {
-		    {{0.0f, -0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.5f, 0.0f}},
-		    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
-		    {{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}}};
-		sceneData.indices = {0, 1, 2};
-		sceneData.materials.push_back({glm::vec4(0.8f, 0.3f, 0.3f, 1.0f), 0.0f, 0.5f, 0.0f, 1.5f, -1, {0, 0, 0}});
-		sceneData.subMeshes.push_back({0, 3, 0, 0});
-		sceneData.instances.push_back({glm::mat4(1.0f), 0});
-	}
-
-	// 1. 上传所有合并后的数组到 GPU
-	vertexBuffer = bufferManager.createDeviceLocalBuffer(sceneData.vertices.data(), sizeof(Vertex) * sceneData.vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-	indexBuffer = bufferManager.createDeviceLocalBuffer(sceneData.indices.data(), sizeof(uint32_t) * sceneData.indices.size(), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-	materialBuffer = bufferManager.createDeviceLocalBuffer(sceneData.materials.data(), sizeof(GPUMaterial) * sceneData.materials.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-	subMeshBuffer = bufferManager.createDeviceLocalBuffer(sceneData.subMeshes.data(), sizeof(SubMesh) * sceneData.subMeshes.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-	// 2. 将数据交由 ASBuilder 进行批量构建
-	asBuilder.buildScene(sceneData, vertexBuffer, indexBuffer);
 }
 
 void Application::createStorageImage()
@@ -87,11 +62,11 @@ void Application::createDescriptors()
 	std::vector<VkDescriptorSetLayoutBinding> bindings = {
 	    {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr},
 	    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_RAYGEN_BIT_KHR, nullptr},
-	    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}, // 顶点
-	    {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}, // 索引
-	    {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}, // SubMeshes
-	    {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr}  // Materials
-	};
+	    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr},
+	    {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr},
+	    {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr},
+	    {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, nullptr},
+	    {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR, nullptr}};
 	rtDescriptorSetLayout = descriptorManager.createLayout(bindings);
 	rtDescriptorSet = descriptorManager.allocateSet(rtDescriptorSetLayout);
 
@@ -135,18 +110,19 @@ void Application::updateDescriptors()
 		return write;
 	};
 
-	VkWriteDescriptorSet vertexWrite = createBufferWrite(rtDescriptorSet, 2, vertexBuffer.buffer);
-	VkWriteDescriptorSet indexWrite = createBufferWrite(rtDescriptorSet, 3, indexBuffer.buffer);
-	VkWriteDescriptorSet subMeshWrite = createBufferWrite(rtDescriptorSet, 4, subMeshBuffer.buffer);
-	VkWriteDescriptorSet materialWrite = createBufferWrite(rtDescriptorSet, 5, materialBuffer.buffer);
+	VkWriteDescriptorSet vertexWrite = createBufferWrite(rtDescriptorSet, 2, renderScene.getVertexBuffer().buffer);
+	VkWriteDescriptorSet indexWrite = createBufferWrite(rtDescriptorSet, 3, renderScene.getIndexBuffer().buffer);
+	VkWriteDescriptorSet subMeshWrite = createBufferWrite(rtDescriptorSet, 4, renderScene.getSubMeshBuffer().buffer);
+	VkWriteDescriptorSet materialWrite = createBufferWrite(rtDescriptorSet, 5, renderScene.getMaterialBuffer().buffer);
+	VkWriteDescriptorSet lightWrite = createBufferWrite(rtDescriptorSet, 6, renderScene.getLightBuffer().buffer);
 
-	descriptorManager.updateSet({asWrite, imageWrite, vertexWrite, indexWrite, subMeshWrite, materialWrite});
+	descriptorManager.updateSet({asWrite, imageWrite, vertexWrite, indexWrite, subMeshWrite, materialWrite, lightWrite});
 
-	// 释放上面动态分配的临时内存
 	delete vertexWrite.pBufferInfo;
 	delete indexWrite.pBufferInfo;
 	delete subMeshWrite.pBufferInfo;
 	delete materialWrite.pBufferInfo;
+	delete lightWrite.pBufferInfo;
 }
 
 void Application::handleResize()
@@ -250,11 +226,8 @@ void Application::cleanup()
 	imageManager.destroyImage(storageImage);
 	descriptorManager.cleanup();
 
+	renderScene.cleanup();
 	asBuilder.cleanup();
-	vDevice.destroyBuffer(vertexBuffer);
-	vDevice.destroyBuffer(indexBuffer);
-	vDevice.destroyBuffer(materialBuffer);
-	vDevice.destroyBuffer(subMeshBuffer);
 
 	imGuiLayer.cleanup();
 	vContext.cleanup();
