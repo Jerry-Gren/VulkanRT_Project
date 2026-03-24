@@ -8,7 +8,7 @@ void Camera::init(glm::vec3 startPosition, float startFov)
 	pitch = 0.0f;
 	fov = startFov;
 
-	movementSpeed = 2.5f;
+	movementSpeed = 1.0f;
 	mouseSensitivity = 0.1f;
 
 	firstMouse = true;

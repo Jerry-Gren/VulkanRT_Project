@@ -48,7 +48,15 @@ void main() {
             break;
         }
 
-        finalColor += throughput * prd.emission;
+        // 【核心修复】：Firefly Clamping 限制单次弹射的最大亮度，根除顽固白噪点
+        vec3 L = throughput * prd.emission;
+        float lum = dot(L, vec3(0.2126, 0.7152, 0.0722));
+        float maxLum = 15.0; // 亮度阈值，超过该值的光线将被压制
+        if (lum > maxLum) {
+            L *= maxLum / lum;
+        }
+
+        finalColor += L;
         throughput *= prd.throughputWeight;
         
         if(prd.depth == 999 || dot(throughput, throughput) == 0.0) {

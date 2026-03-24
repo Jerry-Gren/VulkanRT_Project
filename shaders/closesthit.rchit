@@ -76,13 +76,16 @@ void main() {
         ior = pc.matParams.z;
     }
 
-    // 释放 albedo 的最大钳制阈值，允许纯净的透射能力
     albedo = clamp(albedo, vec3(0.01), vec3(1.0)); 
-    roughness = clamp(roughness, 0.05, 1.0);
+    roughness = clamp(roughness, 0.01, 1.0);
     metallic = clamp(metallic, 0.0, 1.0);
     transmission = clamp(transmission, 0.0, 1.0);
     
     bool isInside = isBackface && (transmission > 0.01);
+
+    if (isInside) {
+        roughness = min(roughness, 0.15); 
+    }
 
     float etaI = isInside ? ior : 1.0;
     float etaT = isInside ? 1.0 : ior;
@@ -108,14 +111,13 @@ void main() {
     float sunAngle = pc.envColor_LgAng.w;
     float sunIntensity = pc.lightDir_LgInt.w;
 
-    if (transmission < 0.99 && !isInside) {
+    if (!isInside) {
         LightSample ls = sampleSun(sunDir, sunAngle, sunIntensity, prd.seed);
         float NdotL = dot(N, ls.L);
         
         if (ls.pdf > 0.0 && NdotL > 0.0) {
             isShadowed = true;
             uint flags = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT;
-            
             vec3 shadowOffset = dot(ls.L, geomNormal) > 0.0 ? geomNormal : -geomNormal;
             traceRayEXT(topLevelAS, flags, 0xFF, 0, 0, 1, offsetRay(worldPos, shadowOffset), 0.001, ls.L, ls.dist, 1);
             
@@ -134,31 +136,32 @@ void main() {
     bool isTransmissivePath = false; 
 
     float randVal = rnd(prd.seed);
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
     if (randVal < pSpecular) {
-        vec3 H = importanceSampleGGX(vec2(rnd(prd.seed), rnd(prd.seed)), N, roughness);
+        vec3 H = sampleGGXVNDF(V, N, roughness, prd.seed);
         nextDir = reflect(-V, H);
         
-        float VdotH = max(dot(V, H), 0.0);
-        float NdotV = max(dot(N, V), 0.0);
-        float NdotH = max(dot(N, H), 0.0);
+        float NdotV = max(dot(N, V), 1e-4);
+        float NdotL = dot(N, nextDir);
         
-        float F_d = fresnelDielectric(VdotH, etaI, etaT);
-        vec3 F0 = mix(vec3(0.04), albedo, metallic);
-        vec3 F = mix(vec3(F_d), fresnelSchlick(VdotH, F0), metallic);
-        float G = GeometrySmith(NdotV, max(dot(N, nextDir), 0.0), roughness);
-        
-        vec3 weight = (F * G * VdotH) / max(NdotV * NdotH, 1e-4);
-        
-        // 【补偿】将因粗糙度剧烈吸收的能量加回，防止变黑
-        vec3 msCompensation = F * (1.0 - G) * roughness;
-        weight += msCompensation;
-        
-        brdfWeight = weight / pSpecular; 
-        rayOriginOffset = physN;
+        // 【核心修复 1】：剔除射向地平线以下的无效反射。丢弃它们代表着正确的 G 项衰减。
+        if (NdotL <= 0.0) {
+            brdfWeight = vec3(0.0);
+        } else {
+            float VdotH = max(dot(V, H), 0.0);
+            float F_d = fresnelDielectric(VdotH, etaI, etaT);
+            vec3 F = mix(vec3(F_d), fresnelSchlick(VdotH, F0), metallic);
+            
+            // 【核心修复 2】：使用严格的 VNDF 数学约分权重 G2/G1，不瞎乘放大系数，根除过曝爆炸！
+            vec3 singleScatterWeight = F * G2_over_G1(NdotV, NdotL, roughness);
+            
+            brdfWeight = singleScatterWeight / pSpecular; 
+            rayOriginOffset = physN;
+        }
     } 
     else if (randVal < pSpecular + pTransmit) {
-        vec3 H = importanceSampleGGX(vec2(rnd(prd.seed), rnd(prd.seed)), N, roughness);
+        vec3 H = sampleGGXVNDF(V, N, roughness, prd.seed);
         if (dot(-V, H) > 0.0) H = -H; 
         
         vec3 refracted = refract(-V, H, eta);
@@ -170,25 +173,24 @@ void main() {
             rayOriginOffset = -physN; 
             isTransmissivePath = true; 
         }
-        brdfWeight = albedo * eTotal; 
+        brdfWeight = vec3(eTotal); 
     } 
     else {
         nextDir = cosineSampleHemisphere(N, prd.seed);
-        // 化简后的纯正 diffuse 权重，避免除以小概率导致噪点爆炸
         brdfWeight = albedo * eTotal;
         rayOriginOffset = physN;
     }
 
-    float cosMax = cos(sunAngle);
-    if (dot(nextDir, sunDir) >= cosMax && !isTransmissivePath) {
+    // 同步限制 cosMax 防止 neePdf 除零溢出
+    float cosMax = min(cos(sunAngle), 0.999999);
+    if (dot(nextDir, sunDir) >= cosMax && !isTransmissivePath && dot(N, nextDir) > 0.0) {
         float bsdfPdf = pdfBRDF(V, nextDir, N, roughness, metallic, transmission);
         float neePdf = 1.0 / (2.0 * PI * (1.0 - cosMax));
         float misWeight_BRDF = powerHeuristic(bsdfPdf, neePdf);
         brdfWeight *= misWeight_BRDF;
     }
 
-    if (rayOriginOffset == physN && dot(nextDir, physN) < 0.0) nextDir = reflect(nextDir, physN);
-    else if (rayOriginOffset == -physN && dot(nextDir, physN) > 0.0) nextDir = reflect(nextDir, physN);
+    // 【核心修复 3】：彻底删除了之前的 nextDir = reflect(nextDir, physN) 镜像 Hack。不再凭空制造漫反射！
 
     if (isInside && transmission > 0.01) {
         vec3 absorption = (1.0 - albedo) * 2.0; 
@@ -197,9 +199,7 @@ void main() {
 
     prd.throughputWeight *= brdfWeight;
 
-    // 【补偿】大幅延后透射光线的轮盘赌判定
-    // 玻璃内部全反射极多，3 次弹射大概率还没穿透出去，给予玻璃光线至少 8 次以上的保底存活期
-    uint rrDepth = (transmission > 0.01) ? 8 : 3;
+    uint rrDepth = (transmission > 0.01) ? 15 : 4;
     if (prd.depth > rrDepth) {
         float pRR = max(prd.throughputWeight.r, max(prd.throughputWeight.g, prd.throughputWeight.b));
         pRR = clamp(pRR, 0.05, 0.95);

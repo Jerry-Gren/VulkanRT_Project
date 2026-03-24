@@ -11,7 +11,8 @@ void main() {
     vec3 dir = normalize(gl_WorldRayDirectionEXT);
     vec3 sunDir = normalize(pc.lightDir_LgInt.xyz);
     float sunAngle = pc.envColor_LgAng.w;
-    float cosMax = cos(sunAngle);
+    // 防止除零
+    float cosMax = min(cos(sunAngle), 0.999999);
     
     if (dot(dir, sunDir) >= cosMax) {
         float solidAngle = 2.0 * PI * (1.0 - cosMax);
